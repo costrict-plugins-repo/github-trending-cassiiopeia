@@ -1,0 +1,650 @@
+// version.yml 파싱·생성 (전체 재생성 전략 D4).
+// ⚠️ YAML 재직렬화 금지 — 주석이 데이터. 템플릿 문자열로 바이트 단위 고정.
+import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { DEPLOY_TARGETS, LABEL_STYLES } from "./constants.js";
+import { REPO_LANGUAGES } from "./repo-language.js";
+
+// 값 목록으로 만든 매칭 패턴 — 목록에 언어·표기를 추가하면 파서가 저절로 읽는다.
+// (언어를 패턴에 박아 두면 새 언어를 저장한 뒤 다음 업데이트에서 못 읽고 ko 로 되돌아간다.)
+const alt = (values) => values.map((v) => v.replace(/[.*+?^${}()|[\]\\-]/g, "\\$&")).join("|");
+const LANGUAGE_RE = new RegExp(`^\\s+language:\\s*["']?(${alt(REPO_LANGUAGES)})["']?`);
+const LABEL_STYLE_RE = new RegExp(`^\\s+label_style:\\s*["']?(${alt(LABEL_STYLES)})["']?`);
+
+const HEADER_EN = `# ===================================================================
+# Project version management file
+# ===================================================================
+#
+# This file keeps version information in one place for every project type.
+# GitHub Actions workflows read this file and manage the version automatically.
+#
+# Usage:
+# 1. version: "1.0.0" - the version shown to users
+# 2. version_code: 1 - Play Store/App Store build number (auto-incremented from 1)
+# 3. project_types: array of project types, the first entry is the primary one
+# 4. project_paths: project folder per type (relative to the repo root, for monorepos)
+#
+# Automatic version updates:
+# - version_code: incremented by 1 on every build (independent of the rules below)
+# - How far the version is bumped is decided by metadata.template.options.semver_auto
+#   semver_auto: true  -> decided by the commit titles in the release range (also when the key is missing)
+#                         "title : feat! : body" or "feat!:" -> major (x+1.0.0)
+#                         "title : feat : body"  or "feat:"  -> minor (x.y+1.0)
+#                         anything else (fix/docs/chore/refactor/test) -> patch (x.y.z+1)
+#   semver_auto: false -> always patch +1
+# - You may edit the version value by hand regardless of the rules above
+#
+# Files synced per project type:
+# - spring: build.gradle (version = "x.y.z")
+# - flutter: pubspec.yaml (version: x.y.z+i, includes buildNumber)
+# - react/node: package.json ("version": "x.y.z")
+# - react-native: iOS Info.plist or Android build.gradle
+# - react-native-expo: app.json (expo.version)
+# - python: pyproject.toml (version = "x.y.z")
+# - basic/other: only this version.yml file is used
+#
+# Related workflows:
+# - .github/workflows/PROJECT-VERSION-CONTROL.yaml
+# - .github/workflows/PROJECT-README-VERSION-UPDATE.yaml
+# - .github/workflows/PROJECT-RELEASE-CHANGELOG.yaml
+#
+# Notes:
+# - Do not change project_types after the initial setup
+# - The version is always synced automatically to the highest one
+# ===================================================================
+`;
+
+// 한국어 레포(options.language: ko)는 주석도 한국어로 쓴다 (#811).
+// 업데이트(--force 는 화면이 en 고정)마다 한국어 주석이 영문으로 바뀌어 version.yml diff 가 86줄이 됐다.
+const HEADER_KO = `# ===================================================================
+# 프로젝트 버전 관리 파일
+# ===================================================================
+#
+# 이 파일은 다양한 프로젝트 타입에서 버전 정보를 중앙 관리하기 위한 파일입니다.
+# GitHub Actions 워크플로우가 이 파일을 읽어 자동으로 버전을 관리합니다.
+#
+# 사용법:
+# 1. version: "1.0.0" - 사용자에게 표시되는 버전
+# 2. version_code: 1 - Play Store/App Store 빌드 번호 (1부터 자동 증가)
+# 3. project_types: 프로젝트 타입 배열 — 첫 항목이 primary
+# 4. project_paths: 타입별 프로젝트 폴더 (레포 루트 기준 상대경로, 모노레포용)
+#
+# 자동 버전 업데이트:
+# - version_code: 매 빌드마다 자동으로 1씩 증가 (아래 판정과 무관)
+# - 버전 승격 폭은 metadata.template.options.semver_auto 가 정합니다
+#   semver_auto: true  -> 릴리스 구간 커밋 제목으로 판정 (키가 없어도 같다)
+#                         "제목 : feat! : 내용" 또는 "feat!:" -> major (x+1.0.0)
+#                         "제목 : feat : 내용"  또는 "feat:"  -> minor (x.y+1.0)
+#                         그 외(fix/docs/chore/refactor/test) -> patch (x.y.z+1)
+#   semver_auto: false -> 항상 patch +1
+# - 위 판정과 무관하게 version 값을 직접 수정해도 됩니다
+#
+# 프로젝트 타입별 동기화 파일:
+# - spring: build.gradle (version = "x.y.z")
+# - flutter: pubspec.yaml (version: x.y.z+i, buildNumber 포함)
+# - react/node: package.json ("version": "x.y.z")
+# - react-native: iOS Info.plist 또는 Android build.gradle
+# - react-native-expo: app.json (expo.version)
+# - python: pyproject.toml (version = "x.y.z")
+# - basic/기타: version.yml 파일만 사용
+#
+# 연관된 워크플로우:
+# - .github/workflows/PROJECT-VERSION-CONTROL.yaml
+# - .github/workflows/PROJECT-README-VERSION-UPDATE.yaml
+# - .github/workflows/PROJECT-RELEASE-CHANGELOG.yaml
+#
+# 주의사항:
+# - project_types는 최초 설정 후 변경하지 마세요
+# - 버전은 항상 높은 버전으로 자동 동기화됩니다
+# ===================================================================
+`;
+
+// 키 옆 한 줄 주석. 언어는 화면 언어가 아니라 레포 문구 언어(options.language)를 따른다.
+const COMMENTS = {
+  en: {
+    versionCode: "app build number",
+    projectTypes: "array of types, first entry is primary, safe to edit by hand",
+    projectPaths: "project folder per type (relative to the repo root)",
+    mode: "install scope (full/version/workflows), used when re-running update mode",
+    intent: "project kind (app/library/both/none/manual), drives the deploy questions",
+    semverAuto: "decide the version bump from commit titles (false means always patch)",
+    projectsSync: "include the GitHub Projects status sync workflow",
+    closeOnRelease: "close issues labelled done when a release is merged (false or missing means do not close)",
+    language: "issue/PR template language (en | ko)",
+    labelStyle: "status label style (en: status: todo / ko: Korean names)",
+    appRelease: "whether releases go through App Store / Play Store review",
+    deploy: "deploy settings remembered by the wizard (non-sensitive, safe to edit by hand)",
+    excluded: "workflow files the update must never install (safe to edit by hand)",
+    storeLocales: "store release-note languages, first is the default (missing = one text for every store language)",
+    storeLocalesStore: "same, only for this store when its languages differ from store_locales (optional)",
+    legacyDeployBranch: "old name of development_branch, kept equal for older skills",
+  },
+  ko: {
+    versionCode: "app build number",
+    projectTypes: "멀티타입 배열 — 첫 항목이 primary, 직접 편집 가능",
+    projectPaths: "타입별 프로젝트 폴더 (레포 루트 기준 상대경로)",
+    mode: "통합 범위(full/version/workflows) — 업데이트 모드 재실행 기준",
+    intent: "프로젝트 성격(app/library/both/none/manual) — 배포 질문 유도 기준",
+    semverAuto: "커밋 제목으로 버전 승격 폭 결정 (false면 항상 patch)",
+    projectsSync: "GitHub Projects 상태 동기화 워크플로우 포함 여부",
+    closeOnRelease: "릴리스 머지 때 완료 라벨 이슈를 닫는다 (false/미기재면 닫지 않음)",
+    language: "이슈/PR 템플릿 언어 (en | ko)",
+    labelStyle: "상태 라벨 표기 (en: status: todo / ko: 작업전)",
+    appRelease: "앱스토어·플레이스토어 심사로 이어지는 배포인가",
+    deploy: "마법사가 기억하는 배포 설정 (비민감 / 직접 수정 가능)",
+    excluded: "업데이트가 절대 설치하지 않을 워크플로우 파일 (직접 수정 가능)",
+    storeLocales: "스토어 릴리스 노트 언어 목록, 첫 항목이 기본 언어 (미기재면 모든 스토어 언어에 같은 문구)",
+    storeLocalesStore: "이 스토어만 언어 구성이 store_locales 와 다를 때 쓰는 선택 키",
+    legacyDeployBranch: "development_branch 의 구 이름 — 구버전 스킬용으로 같은 값 유지",
+  },
+};
+const commentsFor = (lang) => COMMENTS[lang === "ko" ? "ko" : "en"];
+
+// last_updated_by 결정 (#811): 실행한 git 사용자 → 기존 값 → template_integrator.
+// 매번 "template_integrator"로 덮어쓰면 누가 바꿨는지가 사라진다.
+export function resolveUpdatedBy(existingContent = "", cwd = ".") {
+  try {
+    const name = execFileSync("git", ["config", "user.name"],
+      { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    if (name) return name;
+  } catch { /* git 없음·설정 없음(CI) — 기존 값으로 */ }
+  const m = String(existingContent || "").match(/^\s+last_updated_by:\s*"([^"]*)"/m);
+  return m && m[1] ? m[1] : "template_integrator";
+}
+
+// metadata.template.options 상태머신 파싱.
+// 반환(#439 배포/publish 축): { deploy: string|null, publish: string[]|null, secretBackup: bool|null }
+//   deploy: 'docker-ssh'|'vercel'|'none', publish: ['nexus','npm','github-packages'] 부분집합. null=미기재.
+// 구 키(nexus/npm_publish/synology)는 신 축으로 자동 마이그레이션해 읽는다 (v4.2.0 이전 파일 호환):
+//   nexus:true → publish에 'nexus' + deploy 미기재면 'none' (구 동작: nexus면 서버 배포 제외)
+//   npm_publish:true → publish에 'npm'
+//   synology:true → secret_backup 미기재면 true (#473 — 구 Synology 옵션은 Secret 업로드를 포함했으므로
+//                   승계하지 않으면 비대화형 업데이트에서 Secret 백업 워크플로우를 조용히 잃는다)
+// (options-ask.js가 이 함수를 import한다 — 순환 방지 위해 여기(version-yml)에 정의.)
+export function parseTemplateOptions(content) {
+  const out = { deploy: null, publish: null, secretBackup: null,
+                changelogProvider: null, changelogBaseUrl: null, codeReviewCoderabbit: null, aiPrSummary: null, projectsSync: null,
+                deployBranch: null, intent: null, semverAuto: null, appRelease: null, labelStyle: null, closeOnRelease: null, language: null, excludedWorkflows: null, storeLocales: null, storeLocalesIos: null, storeLocalesPlay: null };
+  // 개발 브랜치는 metadata 직속(#456) — template.options 밖이라 별도로 스캔한다.
+  out.deployBranch = readDevelopmentBranch(content);
+  let legacyNexus = null;
+  let legacyNpm = null;
+  let legacySynology = null;
+  // 값 정규화: 따옴표 제거 + 트림
+  const strip = (s) => String(s).replace(/["']/g, "").trim();
+  let inTemplate = false;
+  let inOptions = false;
+  let inCodeReview = false;
+  let inChangelog = false;
+  for (const line of String(content || "").split("\n")) {
+    if (/^\s*template:/.test(line)) { inTemplate = true; continue; }
+    if (inTemplate && /^\s+options:/.test(line)) { inOptions = true; continue; }
+    if (inTemplate && inOptions) {
+      // 중첩 블록 헤더 감지 (options 밑 한 단계) — code_review / changelog (#455)
+      if (/^\s+code_review:\s*$/.test(line)) { inCodeReview = true; inChangelog = false; continue; }
+      if (/^\s+changelog:\s*$/.test(line)) { inChangelog = true; inCodeReview = false; continue; }
+      if (inCodeReview) {
+        const cm = line.match(/^\s+coderabbit:\s*(.+)/);
+        if (cm) { const v = strip(cm[1]); if (v === "true") out.codeReviewCoderabbit = true; if (v === "false") out.codeReviewCoderabbit = false; continue; }
+        // #566 — AI 변경 요약 워크플로우 포함 여부. 키가 없으면 null(미설정)로 두어
+        // 기존 저장소가 업데이트할 때 마법사가 한 번 물어볼 수 있게 한다.
+        const am = line.match(/^\s+ai_summary:\s*(.+)/);
+        if (am) { const v = strip(am[1]); if (v === "true") out.aiPrSummary = true; if (v === "false") out.aiPrSummary = false; continue; }
+      }
+      if (inChangelog) {
+        const pm = line.match(/^\s+provider:\s*(.+)/);
+        if (pm) { out.changelogProvider = strip(pm[1]); continue; }
+        const bm = line.match(/^\s+base_url:\s*(.*)/);
+        if (bm) { out.changelogBaseUrl = strip(bm[1]); continue; }
+      }
+      // intent(프로젝트 성격, #485) — deploy 라인보다 먼저 매칭 (deploy: 와 intent: 구분).
+      // 값 뒤 인라인 주석(# ...)이 붙으므로 따옴표 안 or 첫 토큰만 취한다.
+      let im = line.match(/^\s+intent:\s*["']?([a-z]+)["']?/);
+      if (im) {
+        const v = im[1];
+        if (["app", "library", "both", "none", "manual"].includes(v)) out.intent = v;
+        continue;
+      }
+      let m = line.match(/^\s+deploy:\s*(.+)/);
+      if (m) {
+        const v = strip(m[1]);
+        if (DEPLOY_TARGETS.includes(v)) out.deploy = v;
+        continue;
+      }
+      m = line.match(/^\s+publish:\s*\[([^\]]*)\]/);
+      if (m) {
+        out.publish = strip(m[1]).split(",").map((t) => t.trim()).filter(Boolean);
+        continue;
+      }
+      m = line.match(/^\s+nexus:\s*(.+)/);
+      if (m) {
+        const v = strip(m[1]);
+        if (v === "true") legacyNexus = true;
+        if (v === "false") legacyNexus = false;
+        continue;
+      }
+      m = line.match(/^\s+secret_backup:\s*(.+)/);
+      if (m) {
+        const v = strip(m[1]);
+        if (v === "true") out.secretBackup = true;
+        if (v === "false") out.secretBackup = false;
+        continue;
+      }
+      // semver 자동 승격(#546). null(미기재)이면 호출부가 ON(true)으로 해석한다 (#814). 명시적 false 만 끈다.
+      // 캡처를 true|false로 한정한다(intent와 같은 방식) — 값 뒤 인라인 주석이 값에 딸려오면
+      // strip()은 따옴표·공백만 걷어내므로 "true # ..."가 되어 매칭이 조용히 실패한다.
+      m = line.match(/^\s+semver_auto:\s*["']?(true|false)["']?/);
+      if (m) {
+        out.semverAuto = m[1] === "true";
+        continue;
+      }
+      // 레포 문구 언어(#769) — en | ko. 미기재는 "기존 통합 레포" 신호라 호출부가 ko 로 해석한다.
+      m = line.match(LANGUAGE_RE);
+      if (m) {
+        out.language = m[1];
+        continue;
+      }
+      // 상태 라벨 표기(#776) — en(영문 표준) | ko(기존 한글). 미기재는 "기존 통합 레포" 신호라 호출부가 ko로 해석한다.
+      m = line.match(LABEL_STYLE_RE);
+      if (m) {
+        out.labelStyle = m[1];
+        continue;
+      }
+      // Projects 보드 동기화(#716). null(미기재)이면 호출부가 "이미 설치돼 있으면 유지, 아니면 제외"로 해석한다.
+      m = line.match(/^\s+projects_sync:\s*["']?(true|false)["']?/);
+      if (m) {
+        out.projectsSync = m[1] === "true";
+        continue;
+      }
+      // 릴리스 시 완료 이슈 닫기(#771). null(미기재)은 "기존 통합 레포" 신호 — 워크플로우가 아무것도 하지 않는다.
+      m = line.match(/^\s+close_on_release:\s*["']?(true|false)["']?/);
+      if (m) {
+        out.closeOnRelease = m[1] === "true";
+        continue;
+      }
+      // 설치하지 않을 워크플로우 (#810) — 인라인 배열. 업데이트가 지운 파일을 되살리지 않게 하는 명시 수단이다.
+      m = line.match(/^\s+excluded_workflows:\s*\[([^\]]*)\]/);
+      if (m) {
+        out.excludedWorkflows = m[1].split(",").map((s) => s.trim().replace(/^["']|["']$/g, "")).filter(Boolean);
+        continue;
+      }
+      // 스토어 릴리스 노트 언어 (#829) — 인라인 배열, 첫 항목이 기본 언어. 미기재면 현행 동작(한 문구를 모든 언어에).
+      m = line.match(/^\s+store_locales:\s*\[([^\]]*)\]/);
+      if (m) {
+        out.storeLocales = m[1].split(",").map((s) => s.trim().replace(/^["']|["']$/g, "")).filter(Boolean);
+        continue;
+      }
+      // 스토어마다 지원 언어가 다를 때만 쓰는 선택 키 — 있으면 그 스토어는 공통 store_locales 대신 이것을 쓴다.
+      m = line.match(/^\s+store_locales_(ios|play):\s*\[([^\]]*)\]/);
+      if (m) {
+        out[m[1] === "ios" ? "storeLocalesIos" : "storeLocalesPlay"] = m[2].split(",").map((s) => s.trim().replace(/^["']|["']$/g, "")).filter(Boolean);
+        continue;
+      }
+      // 프로젝트 성격(#553) — 앱 심사로 이어지는 레포인가. 워크플로우와 스킬이 같은 값을 본다.
+      m = line.match(/^\s+app_release:\s*["']?(true|false)["']?/);
+      if (m) {
+        out.appRelease = m[1] === "true";
+        continue;
+      }
+      m = line.match(/^\s+npm_publish:\s*(.+)/);
+      if (m) {
+        const v = strip(m[1]);
+        if (v === "true") legacyNpm = true;
+        if (v === "false") legacyNpm = false;
+        continue;
+      }
+      m = line.match(/^\s+synology:\s*(.+)/);
+      if (m) {
+        const v = strip(m[1]);
+        if (v === "true") legacySynology = true;
+        if (v === "false") legacySynology = false;
+        continue;
+      }
+      // 들여쓰기 0~4칸의 다른 키 → options 섹션 종료
+      if (/^\s{0,4}[a-z_]+:/.test(line)) { inOptions = false; inTemplate = false; }
+    }
+    // 최상위 키 → template 섹션 종료
+    if (inTemplate && /^[a-z_]+:/.test(line)) { inTemplate = false; inOptions = false; }
+  }
+  // ── 구 키 마이그레이션 — 신 publish 키가 없을 때만 ──
+  if (out.publish === null && (legacyNexus !== null || legacyNpm !== null)) {
+    out.publish = [];
+    if (legacyNexus === true) {
+      out.publish.push("nexus");
+      if (out.deploy === null) out.deploy = "none";
+    }
+    if (legacyNpm === true) out.publish.push("npm");
+  }
+  // 구 synology 키 → secret_backup 승계 (#473) — 신 키가 명시된 경우는 신 키 우선
+  if (out.secretBackup === null && legacySynology === true) out.secretBackup = true;
+  return out;
+}
+
+// deploy/publish 저장값에서 intent(프로젝트 성격) 역추론 (#485 — intent 키 없는 구 version.yml 하위호환).
+//   deploy≠none & publish=[]  → app     (서버/앱만)
+//   deploy=none & publish≠[]  → library (라이브러리만)
+//   deploy≠none & publish≠[]  → both
+//   deploy=none & publish=[]  → none
+// deploy/publish가 아직 null(미설정)이면 intent도 추론 불가 → null 반환(진입 질문을 하도록).
+export function inferIntent(deploy, publish) {
+  if (deploy == null && (publish == null)) return null;
+  const hasServer = deploy != null && deploy !== "none";
+  const hasLib = Array.isArray(publish) && publish.length > 0;
+  if (hasServer && hasLib) return "both";
+  if (hasServer) return "app";
+  if (hasLib) return "library";
+  return "none";
+}
+
+// v4.1.0 이전 단수 project_type 키 → project_types 배열 최소 변환 (#471).
+// version.yml을 재생성하지 않는 경로(workflows 모드)에서 신형 version_manager(단수 키 명시 거부)와의
+// 정합을 맞춘다 — 해당 라인만 교체하고 나머지 내용은 손대지 않는다.
+// 배열 키가 이미 있으면 남은 단수 키만 제거한다(4.1.0: 공존 시 단수 무시 — 잔재 정리).
+// 반환: 변환된 전체 내용 문자열, 변환할 것이 없으면 null.
+export function convertLegacySingularType(content) {
+  const lines = String(content || "").split(/\r?\n/);
+  let hasArray = false, idx = -1, value = "";
+  lines.forEach((l, i) => {
+    if (/^project_types:/.test(l)) hasArray = true;
+    const m = l.match(/^project_type:\s*["']?([a-z-]+)["']?/);
+    if (m && idx < 0) { idx = i; value = m[1]; }
+  });
+  if (idx < 0) return null;
+  if (hasArray) {
+    lines.splice(idx, 1);
+    return lines.join("\n");
+  }
+  const type = value === "next" ? "react" : value; // next 타입은 4.1.0에서 react로 흡수
+  lines[idx] = `project_types: ["${type}"]   # array of types, first entry is primary, safe to edit by hand`;
+  return lines.join("\n");
+}
+
+// 개발(릴리스 소스) 브랜치 = 릴리스 PR head (#915)
+// 키 2개: development_branch(정본) > deploy_branch(구 이름 — 이것만 읽는 구버전 스킬이 있어 함께 기록)
+// 반환: 브랜치명, 둘 다 없으면 null
+export const DEVELOPMENT_BRANCH_KEYS = ["development_branch", "deploy_branch"];
+export function readDevelopmentBranch(content) {
+  const lines = String(content || "").split("\n").filter((l) => !l.startsWith("#"));
+  for (const key of DEVELOPMENT_BRANCH_KEYS) {
+    const re = new RegExp(`^\\s+${key}:\\s*"([^"]*)"`);
+    for (const l of lines) {
+      const m = l.match(re);
+      if (m) return m[1];
+    }
+  }
+  return null;
+}
+
+// 기존 version.yml에서 값 추출 (라인 정규식, 주석 라인 오탐 방지).
+export function parseExisting(content) {
+  const text = String(content || "");
+  const line = (re) => {
+    for (const l of text.split("\n")) {
+      if (l.startsWith("#")) continue; // 주석 제외
+      const m = l.match(re);
+      if (m) return m[1];
+    }
+    return null;
+  };
+  // version: "x.y.z" (숫자.숫자.숫자 형태만)
+  const version = line(/^version:\s*["']?([0-9][0-9.]*)["']?/) || "";
+  // version_code: N (양의 정수, 아니면 1)
+  let versionCode = parseInt(line(/^version_code:\s*([0-9]+)/) || "", 10);
+  if (!Number.isInteger(versionCode) || versionCode <= 0) versionCode = 1;
+  // project_types: ["a","b"]
+  const typesRaw = line(/^project_types:\s*(\[[^\]]*\])/);
+  let types = [];
+  if (typesRaw) types = [...typesRaw.matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+  // project_paths 블록: "  type: "path""
+  const paths = new Map();
+  let inPaths = false;
+  for (const l of text.split("\n")) {
+    if (/^project_paths:/.test(l)) { inPaths = true; continue; }
+    if (inPaths) {
+      const m = l.match(/^\s+([a-z-]+):\s*"([^"]*)"/);
+      if (m) paths.set(m[1], m[2]);
+      else if (/^\S/.test(l)) inPaths = false; // 들여쓰기 끝 → 블록 종료
+    }
+  }
+  // template: 블록 내 version + mode (#502 — 업데이트 모드가 재실행할 통합 범위)
+  let templateVersion = "";
+  let templateMode = null;
+  let inTemplate = false;
+  for (const l of text.split("\n")) {
+    if (/^\s*template:/.test(l)) { inTemplate = true; continue; }
+    if (inTemplate) {
+      const vm = l.match(/^\s*version:\s*"([0-9][0-9.]*)"/);
+      if (vm && !templateVersion) templateVersion = vm[1];
+      const mm = l.match(/^\s*mode:\s*"([a-z]+)"/);
+      if (mm && ["full", "version", "workflows"].includes(mm[1])) templateMode = mm[1];
+      if (/^\S/.test(l)) break;
+    }
+  }
+  // 브랜치 정보 (#456) — default_branch(레포 기본)와 개발 브랜치(릴리스 PR head)는 별개.
+  const defaultBranch = line(/^\s*default_branch:\s*"([^"]*)"/);
+  const deployBranch = readDevelopmentBranch(text);
+  // 선택 워크플로우 옵션 (metadata.template.options — nexus/secret_backup)
+  const options = parseTemplateOptions(text);
+  return { version, versionCode, types, paths, templateVersion, templateMode, options, defaultBranch, deployBranch };
+}
+
+// ── 생성기가 모르는 키를 지키기 (#835) ─────────────────────────────────────────────
+// version.yml 은 매 full/version 실행마다 처음부터 다시 쓴다. 생성기가 아는 키만 쓰면 사용자가 넣은 것은 사라진다 —
+// 특히 문서화된 `options.issue_helper`(브랜치 접두사·커밋 템플릿·시간대 …)가 업데이트마다 조용히 초기화됐다.
+// 그래서 아는 키는 지금처럼 만들고, 모르는 키는 **글자 그대로**(들여쓰기·주석 포함) 되돌려 쓴다.
+// project_type(단수)는 v4.1.0 에서 없앴다 — 남기면 version_manager 가 거부한다. 그래서 보존하지 않고 버린다.
+const OWNED_TOP = new Set(["version", "version_code", "project_types", "project_type", "project_paths", "metadata", "deploy"]);
+// metadata.template.options 아래에서 생성기가 직접 쓰는 키. 여기에 없는 것만 보존한다.
+// buildVersionYml 이 쓰는 6칸 키와 같아야 한다 — 빠지면 재실행마다 그 키가 두 번 쓰인다 (대조: test/version-yml-preserve.test.js).
+// nexus · npm_publish · synology 는 옛 키다 — 파서가 신형(publish · secret_backup)으로 바꿔 쓰므로 그대로 두면 이중 기록이 된다.
+export const OWNED_OPTION_KEYS = new Set(["intent", "deploy", "publish", "secret_backup", "semver_auto", "projects_sync", "close_on_release",
+  "language", "label_style", "app_release", "excluded_workflows", "store_locales", "store_locales_ios", "store_locales_play",
+  "code_review", "changelog",
+  "nexus", "npm_publish", "synology"]);
+
+// indent 칸으로 시작하는 키 한 줄과 그 자식(더 깊은 들여쓰기·빈 줄·그 아래의 주석)을 한 덩어리로 자른다.
+function keyBlocks(lines, indent, isOwned) {
+  const keyRe = new RegExp(`^ {${indent}}([A-Za-z_][\\w-]*):`);
+  const blocks = [];
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(keyRe);
+    if (!m) continue;
+    let j = i + 1;
+    while (j < lines.length && (lines[j].trim() === "" || /^\s/.test(lines[j]) && lines[j].search(/\S/) > indent
+      || (lines[j].trim().startsWith("#") && lines[j].search(/\S/) > indent))) j++;
+    while (j > i + 1 && lines[j - 1].trim() === "") j--;   // 덩어리 끝의 빈 줄은 뺀다
+    const block = lines.slice(i, j).join("\n");
+    if (!isOwned(m[1]) && looksWellFormed(block)) blocks.push(block);
+    i = j - 1;
+  }
+  return blocks;
+}
+
+// 되돌려 쓸 덩어리가 깨진 YAML 이면 version.yml 전체가 깨진다 — 그러면 모든 워크플로가 버전을 못 읽는다.
+// 의존성 없이 확인할 수 있는 만큼만 본다: 괄호·중괄호 짝, 닫히지 않은 따옴표. 의심스러우면 버린다(보존보다 파일 무결성이 먼저).
+function looksWellFormed(block) {
+  const text = block.split("\n").map((l) => l.replace(/\s#.*$/, "")).join("\n");   // 줄 끝 주석은 짝 검사에서 뺀다
+  const stack = [];
+  const pairs = { "]": "[", "}": "{" };
+  let quote = null;
+  for (const ch of text) {
+    if (quote) { if (ch === quote) quote = null; continue; }
+    if (ch === '"' || ch === "'") { quote = ch; continue; }
+    if (ch === "[" || ch === "{") stack.push(ch);
+    else if (ch === "]" || ch === "}") { if (stack.pop() !== pairs[ch]) return false; }
+  }
+  return !quote && stack.length === 0;
+}
+
+/** 기존 version.yml 에서 생성기가 모르는 것만 뽑는다. { optionBlocks: string[], topBlocks: string[] } */
+export function extractCustomYml(content) {
+  const lines = String(content || "").split(/\r?\n/);
+  const topBlocks = keyBlocks(lines, 0, (k) => OWNED_TOP.has(k));
+  // metadata → template → options 구간만 잘라 6칸 들여쓴 키를 본다
+  const find = (from, to, re) => { for (let i = from; i < to; i++) if (re.test(lines[i])) return i; return -1; };
+  const end = (start, indent) => { let j = start + 1; while (j < lines.length && (lines[j].trim() === "" || lines[j].search(/\S/) > indent)) j++; return j; };
+  const md = find(0, lines.length, /^metadata:/);
+  let optionBlocks = [];
+  if (md >= 0) {
+    const mdEnd = end(md, 0);
+    const tp = find(md + 1, mdEnd, /^ {2}template:/);
+    if (tp >= 0) {
+      const tpEnd = end(tp, 2);
+      const op = find(tp + 1, tpEnd, /^ {4}options:/);
+      if (op >= 0) optionBlocks = keyBlocks(lines.slice(op + 1, end(op, 4)), 6, (k) => OWNED_OPTION_KEYS.has(k));
+    }
+  }
+  return { optionBlocks, topBlocks };
+}
+
+/**
+ * buildVersionYml 에 그대로 펼쳐 넣는 도우미: `...customYml(경로)`.
+ * 파일이 없거나 읽을 수 없으면 아무것도 보존하지 않는다 — 읽기 실패가 업데이트를 막으면 안 된다.
+ */
+export function customYml(file) {
+  try {
+    const { optionBlocks, topBlocks } = extractCustomYml(readFileSync(file, "utf8"));
+    return { customOptionBlocks: optionBlocks, customTopBlocks: topBlocks };
+  } catch {
+    return {};
+  }
+}
+
+// 기존 version.yml 의 deploy 블록 → Map<type, Map<key,value>> (#670 — 재실행 시 사용자 수정값 보존용).
+// 4.28.0 이 만든 깨진 구조(deploy 아래에 2칸 들여쓴 template 이 딸려 있음)도 읽을 수 있게,
+// 2칸 키 `template` 은 타입이 아니라 블록 종료로 본다.
+export function parseDeployBlock(content) {
+  const out = new Map();
+  let inDeploy = false;
+  let type = null;
+  for (const line of String(content || "").split(/\r?\n/)) {
+    if (/^deploy:/.test(line)) { inDeploy = true; type = null; continue; }
+    if (!inDeploy) continue;
+    if (line === "" || /^\s*#/.test(line)) continue;
+    if (/^\S/.test(line) || /^ {2}template:/.test(line)) { inDeploy = false; continue; }
+    const t = line.match(/^ {2}([A-Za-z0-9_-]+):\s*(#.*)?$/);
+    if (t) { type = t[1]; if (!out.has(type)) out.set(type, new Map()); continue; }
+    const kv = line.match(/^ {4}([A-Za-z0-9_.-]+):\s*"([^"]*)"/);
+    if (kv && type) out.get(type).set(kv[1], kv[2]);
+  }
+  return out;
+}
+
+// 재실행 시 기존 deploy 값 우선 병합 (#670) — 사용자가 version.yml 에서 직접 고친 값이 템플릿 기본값에
+// 덮이지 않게 한다. 기존 값이 이기고, 이번에 새로 묻는 키만 추가된다.
+export function mergeDeployValues(existingContent, fresh) {
+  const merged = parseDeployBlock(existingContent);
+  for (const [t, kv] of fresh) {
+    if (!merged.has(t)) merged.set(t, new Map());
+    for (const [k, v] of kv) if (!merged.get(t).has(k)) merged.get(t).set(k, v);
+  }
+  return merged;
+}
+
+// version.yml 전체 생성 (metadata > template 옵션 > deploy > 사용자 블록).
+// opts: { version, types:[], paths:Map, pathMarkers?:Map, branch, versionCode, now, today, templateOptions? }
+// primary 타입은 별도 키 없이 project_types[0]이다 (v4.1.0 SSOT — 단수 project_type 키 제거).
+//   now   = "YYYY-MM-DD HH:MM:SS" (UTC) — 결정성 위해 주입
+//   today = "YYYY-MM-DD" (UTC)
+//   pathMarkers = Map<type, markerFilename> (project_paths 주석용)
+//   templateOptions = { templateVersion, deployTarget, publishTargets, includeSecretBackup, optionsDate } (template 블록)
+export function buildVersionYml({ version, types = [], paths = new Map(), pathMarkers = new Map(), branch = "main", deployBranch = "", versionCode = 1, now, today, templateOptions = null, deployValues = new Map(), updatedBy = "template_integrator", customOptionBlocks = [], customTopBlocks = [] }) {
+  const lang = templateOptions?.language === "ko" ? "ko" : "en";
+  const C = commentsFor(lang);
+  const typesJson = types.length ? `[${types.map((t) => `"${t}"`).join(",")}]` : `["basic"]`;
+
+  let out = (lang === "ko" ? HEADER_KO : HEADER_EN) + "\n";
+  out += `version: "${version}"\n`;
+  out += `version_code: ${versionCode} # ${C.versionCode}\n`;   // 공백 1칸 — version_manager.py 가 쓰는 형태와 같아야 업데이트 diff 가 안 생긴다
+  out += `project_types: ${typesJson}   # ${C.projectTypes}\n`;
+
+  // project_paths 블록. pathMarkers: Map<type, markerFilename> (있으면 "  type: "path"   # path/marker" 주석).
+  if (paths.size) {
+    out += `project_paths:                # ${C.projectPaths}\n`;
+    for (const [t, p] of paths) {
+      const marker = pathMarkers.get(t) || "";
+      const pf = p === "." ? marker : (marker ? `${p}/${marker}` : p);
+      out += marker ? `  ${t}: "${p}"   # ${pf}\n` : `  ${t}: "${p}"\n`;
+    }
+  }
+
+  out += `metadata:\n`;
+  out += `  last_updated: "${now}"\n`;
+  out += `  last_updated_by: "${String(updatedBy || "template_integrator").replace(/"/g, "")}"\n`;
+  out += `  default_branch: "${branch}"\n`;
+  // 개발(릴리스 소스) 브랜치 = 릴리스 PR head (#456). default_branch(레포 기본)와 별개 개념.
+  // 지정된 경우에만 출력 — 미지정이면 스킬이 develop로 폴백.
+  // deploy_branch 병기: 그 키만 읽는 구버전 스킬(changelog_cli)이 develop로 폴백하지 않게 (#915)
+  if (deployBranch) {
+    out += `  development_branch: "${deployBranch}"\n`;
+    out += `  deploy_branch: "${deployBranch}"   # ${C.legacyDeployBranch}\n`;
+  }
+  out += `  integrated_from: "projectops"\n`;
+  out += `  integration_date: "${today}"\n`;
+
+  // template 옵션 블록. templateOptions 지정 시.
+  if (templateOptions) {
+    const { templateVersion = "unknown", deployTarget = "docker-ssh", publishTargets = [], includeSecretBackup = false, optionsDate = today,
+            changelogProvider = "commit", changelogBaseUrl = "", codeReviewCoderabbit = true, aiPrSummary = true, intent = null, mode = null,
+            semverAuto = true, appRelease = null, labelStyle = null, closeOnRelease = null, projectsSync = null, language = null, excludedWorkflows = null, storeLocales = null, storeLocalesIos = null, storeLocalesPlay = null } = templateOptions;
+    const publishJson = `[${publishTargets.map((t) => `"${t}"`).join(",")}]`;
+    // intent(프로젝트 성격, #485) — 미지정이면 deploy/publish에서 역추론해 기록 (재통합 시 진입 질문 생략용)
+    const intentVal = intent || inferIntent(deployTarget, publishTargets) || "manual";
+    out += `  template:\n`;
+    out += `    source: "projectops"\n`;
+    out += `    version: "${templateVersion}"\n`;
+    // mode(#502) — 이 레포에 통합된 범위. 업데이트 모드가 같은 범위를 재실행하는 기준.
+    if (mode) out += `    mode: "${mode}"   # ${C.mode}\n`;
+    out += `    integrated_date: "${optionsDate}"\n`;
+    out += `    last_update_date: "${optionsDate}"\n`;
+    out += `    options:\n`;
+    out += `      intent: "${intentVal}"   # ${C.intent}\n`;
+    out += `      deploy: "${deployTarget}"\n`;
+    out += `      publish: ${publishJson}\n`;
+    out += `      secret_backup: ${includeSecretBackup}\n`;
+    // semver 자동 승격(#546) — 릴리스 시 커밋 제목으로 major/minor/patch 결정. false면 항상 patch.
+    out += `      semver_auto: ${semverAuto}   # ${C.semverAuto}\n`;
+    // Projects 보드 동기화(#716) — 미지정이면 키를 쓰지 않는다.
+    if (projectsSync !== null) out += `      projects_sync: ${projectsSync}   # ${C.projectsSync}\n`;
+    // 릴리스 시 완료 이슈 닫기(#771) — 미지정이면 키를 쓰지 않는다(기존 레포는 현행 유지).
+    if (closeOnRelease !== null) out += `      close_on_release: ${closeOnRelease}   # ${C.closeOnRelease}\n`;
+    // 상태 라벨 표기(#776) — 미지정이면 키를 쓰지 않는다(기존 레포 무변화).
+    // 레포 문구 언어(#769) — 미지정이면 키를 쓰지 않는다(기존 레포 무변화).
+    // 설치 제외 목록(#810) — 전체 재생성이라 다시 쓰지 않으면 사용자가 적은 목록이 사라진다.
+    if (excludedWorkflows && excludedWorkflows.length) out += `      excluded_workflows: [${excludedWorkflows.map((f) => `"${f}"`).join(", ")}]   # ${C.excluded}\n`;
+    // 스토어 릴리스 노트 언어(#829) — 미지정이면 키를 쓰지 않는다. 전체 재생성이라 다시 쓰지 않으면 사용자가 적은 값이 사라진다.
+    if (storeLocales && storeLocales.length) out += `      store_locales: [${storeLocales.map((l) => `"${l}"`).join(", ")}]   # ${C.storeLocales}\n`;
+    if (storeLocalesIos && storeLocalesIos.length) out += `      store_locales_ios: [${storeLocalesIos.map((l) => `"${l}"`).join(", ")}]   # App Store: ${C.storeLocalesStore}\n`;
+    if (storeLocalesPlay && storeLocalesPlay.length) out += `      store_locales_play: [${storeLocalesPlay.map((l) => `"${l}"`).join(", ")}]   # Play: ${C.storeLocalesStore}\n`;
+    if (language) out += `      language: ${language}   # ${C.language}\n`;
+    if (labelStyle) out += `      label_style: ${labelStyle}   # ${C.labelStyle}\n`;
+    // 앱 심사 배포 레포 여부(#553) — 미지정이면 키를 쓰지 않는다(기존 레포 무변화).
+    if (appRelease !== null) {
+      out += `      app_release: ${appRelease}   # ${C.appRelease}\n`;
+    }
+    out += `      code_review:\n`;
+    out += `        coderabbit: ${codeReviewCoderabbit}\n`;
+    out += `        ai_summary: ${aiPrSummary}\n`;
+    out += `      changelog:\n`;
+    out += `        provider: "${changelogProvider}"\n`;
+    out += `        base_url: "${changelogBaseUrl}"\n`;
+    // 생성기가 모르는 옵션(issue_helper 등)은 그대로 되돌려 쓴다 (#835)
+    for (const b of customOptionBlocks) out += `${b}\n`;
+  }
+
+  // deploy 블록. deployValues: Map<type, Map<key,value>>.
+  // WF ask 값이 있는 타입만. 반드시 template 뒤의 별도 최상위 키로 둔다 — metadata 와 template
+  // 사이에 끼면 template 이 deploy 의 자식이 되어 metadata.template.options 구조가 깨진다 (#670).
+  const deployTypes = [...deployValues.keys()].filter((t) => deployValues.get(t) && deployValues.get(t).size > 0);
+  if (deployTypes.length) {
+    out += `\n`;
+    out += `deploy:                          # ${C.deploy}\n`;
+    for (const t of deployTypes) {
+      out += `  ${t}:\n`;
+      for (const [k, v] of deployValues.get(t)) out += `    ${k}: "${v}"\n`;
+    }
+  }
+  // 최상위의 모르는 키도 그대로 (#835)
+  for (const b of customTopBlocks) out += `\n${b}\n`;
+  return out;
+}

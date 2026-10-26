@@ -1,0 +1,484 @@
+// 워크플로우 복사 엔진.
+//
+// 충돌(기존 파일과 다름)의 처리 결정은 hooks.decisions(Map<파일명, 'skip'|'backup'|'template'>)로 받는다.
+//   - 실제 마법사(commands/interactive.js)는 listWorkflowConflicts 로 충돌 목록을 얻어 직접 Map 을 만든다.
+//   - copyWorkflowsInteractive 는 onConflict 콜백으로 같은 Map 을 만들어 주는 보조 API 다. 프로덕션 경로는 쓰지 않고
+//     테스트(copy-workflows-conflict.test.js)만 쓴다.
+import { join, basename } from "node:path";
+import { existsSync, readFileSync, writeFileSync, renameSync } from "node:fs";
+import { PATHS } from "../paths.js";
+import { exists, copyFileSync, listYamlFiles } from "../fsutil.js";
+import { isUnchanged, substituteEnv, resolveGlobalTokens, extractEnvValues } from "../wizard-env.js";
+import { isUserModified, readBaseline, writeBaseline, sha256 } from "../baseline.js";
+import { substituteBranches } from "../branch-sub.js";
+import { saveIncoming, lineDiffCounts } from "../incoming.js";
+import { branchStatus } from "../git-branch.js";
+import { PUBLISH_TARGETS } from "../constants.js";
+import { commonOptionalGroups, serverDeployEnabled, SERVER_DEPLOY_DIR } from "../workflow-groups.js";
+
+// on: 블록의 브랜치 필터가 전부 develop 뿐인가 (#810).
+// 개발 브랜치가 없는 레포에 깔면 영영 실행되지 않는 워크플로우를 가린다.
+// workflow_dispatch 외의 다른 이벤트(schedule·issues 등)가 있으면 그것만으로도 돌 수 있으니 false.
+export function onlyTriggersOnDevelop(content) {
+  const m = String(content).match(/^on:\s*\n((?:[ \t]+.*\n|\s*\n)+)/m);
+  if (!m) return false;
+  const block = m[1];
+  const events = [...block.matchAll(/^ {2}([a-z_]+):/gm)].map((x) => x[1]);
+  if (!events.length || events.some((e) => !["push", "pull_request", "workflow_dispatch"].includes(e))) return false;
+  const branches = [];
+  for (const b of block.matchAll(/^\s+branches:\s*\[([^\]]*)\]/gm)) branches.push(...b[1].split(",").map((s) => s.trim().replace(/["']/g, "")).filter(Boolean));
+  for (const b of block.matchAll(/^\s+branches:\s*\n((?:\s+-\s*.*\n)+)/gm)) branches.push(...[...b[1].matchAll(/-\s*["']?([^"'\s#]+)/g)].map((x) => x[1]));
+  // push/pull_request 마다 branches 필터가 있어야 한다 — 필터 없는 push 는 모든 브랜치에서 돈다
+  const filtered = (block.match(/^\s+branches:/gm) || []).length;
+  const needFilter = events.filter((e) => e !== "workflow_dispatch").length;
+  return branches.length > 0 && filtered >= needFilter && branches.every((b) => b === "develop");
+}
+
+// 한 파일에 env 치환을 적용해 대상 파일을 갱신.
+// values/useDefaults: env 계획(promptEnvPlan) 결과 — 미지정이면 기본값 경로(현행 force 동작).
+// trace(#494): 치환 1건당 env.substituted 이벤트 (before/after 포함 — 치환 불일치류 버그의 즉시 발견 근거).
+function configureEnv(targetPath, filename, { type, projectPath = ".", repoName = "", resolvers = {}, collectAsks = null, values = new Map(), useDefaults = true, trace = null }) {
+  const content = readFileSync(targetPath, "utf8");
+  if (!content.includes("@wizard")) return;
+  const collectSubs = trace ? [] : null;
+  const out = substituteEnv(content, { type, useDefaults, values, projectPath, repoName, resolvers, collectAsks, collectSubs });
+  writeFileSync(targetPath, out);
+  if (trace && collectSubs) {
+    for (const s of collectSubs) trace.event("env", "substituted", filename, { type, ...s });
+  }
+}
+
+// util 버전 동기화 워크플로우 (#491) — .github/util/ 모듈(version.json)이 있는 레포에서만 의미가 있다.
+// util이 없는 레포(예: spring 단독)에 복사하면 트리거가 영원히 안 걸리는 no-op 오염이 된다.
+const UTIL_VERSION_SYNC = "PROJECT-COMMON-TEMPLATE-UTIL-VERSION-SYNC.yml";
+
+// 이 통합에서 util 모듈이 존재하게 되는가 — 대상에 이미 있거나(업데이트),
+// 선택 타입의 util이 템플릿에 있어 곧 복사될 예정(runFull 6단계)이면 true.
+function utilSyncApplies(tempDir, targetRoot, types) {
+  if (exists(join(targetRoot, ".github", "util"))) return true;
+  return types.some((t) => exists(join(tempDir, ".github", "util", t)));
+}
+
+// 4분류 (신규/unchanged/upstream/changed) — 대상 워크플로우 디렉토리 기준.
+//
+// upstream(#557): 사용자가 손대지 않았는데 템플릿만 바뀐 파일. 질문할 이유가 없으므로
+// 그냥 최신으로 올린다. baseline(설치 시점 해시)이 있어야 판정할 수 있다.
+// baseline이 없거나 그 파일 기록이 없으면 판정 불가 → 종전대로 changed로 떨어뜨린다
+// (기존 통합 레포의 동작이 바뀌지 않는다).
+function classify(srcDir, workflowsDir, envOpts, baseline = null) {
+  const result = { newFiles: [], unchanged: [], changed: [], upstream: [] };
+  for (const filename of listYamlFiles(srcDir)) {
+    const src = join(srcDir, filename);
+    const dst = join(workflowsDir, filename);
+    if (existsSync(dst)) {
+      const tpl = readFileSync(src, "utf8");
+      const inst = readFileSync(dst, "utf8");
+      if (isUnchanged(tpl, inst, envOpts)) { result.unchanged.push(filename); continue; }
+      // 여기 왔다는 건 "지금 템플릿 렌더 결과 ≠ 설치본" — 사용자 수정이거나 업스트림 변경이다.
+      // baseline이 그 둘을 가른다.
+      const modified = isUserModified(baseline, filename, inst);
+      if (modified === false) result.upstream.push(filename);
+      else result.changed.push(filename);
+    } else {
+      result.newFiles.push(filename);
+    }
+  }
+  return result;
+}
+
+// copy_workflows 본체 (동기 — 기존 호출부 무변경).
+// context: { types:[], paths:Map, deployTarget, publishTargets:[], includeSecretBackup, aiPrSummary, force, repoName, resolvers,
+//            envValues?:Map<key,value>, envUseDefaults?:boolean }  ← env 계획(promptEnvPlan) 결과 주입점
+//   deployTarget(#439 택1): 'docker-ssh'(기본) | 'vercel' | 'none' — server-deploy는 docker-ssh일 때만,
+//   common/deploy/<target>/은 해당 타겟일 때 복사. publishTargets(#439 다중): 'nexus'|'npm'|'github-packages'.
+// hooks: { decisions?: Map<filename, 'skip'|'backup'|'template'> } — 기존 파일(changed) 충돌 결정.
+// 반환: {copied, skipped, templateAdded, optionalCopied, copiedFiles[]} — copiedFiles는 실제 복사·교체된 파일명 (#473 요약용)
+export function copyWorkflows(context, tempDir, targetRoot = ".", hooks = {}) {
+  const { types = [], paths = new Map(), deployTarget = "docker-ssh", publishTargets = [], includeSecretBackup = false, aiPrSummary = true, projectsSync = true, repoName = "", resolvers = {}, envValues = new Map(), envUseDefaults = true, branch = "", deployBranch = "" } = context;
+  const decisions = hooks.decisions instanceof Map ? hooks.decisions : new Map();
+  const trace = hooks.trace ?? null; // #494 — 실행 트레이스 (null-safe: 미주입이면 전 이벤트 no-op)
+  const workflowsDir = join(targetRoot, PATHS.workflowsDir);
+  // 설치 시점 기준점(#557) — 없으면 null이고 classify가 종전 2-way로 폴백한다.
+  const baseline = readBaseline(targetRoot);
+  const projectTypesDir = join(tempDir, PATHS.workflowsDir, PATHS.projectTypesDir);
+  if (!exists(projectTypesDir)) throw new Error("템플릿 저장소 구조 오류 — project-types 폴더를 찾지 못했습니다.");
+
+  const counters = { copied: 0, skipped: 0, templateAdded: 0, optionalCopied: 0, copiedFiles: [],
+    replacedBak: [], // #673 — 기준점이 없어 수정 여부를 모른 채 .bak 백업 후 교체한 파일명
+    skippedConflicts: [] }; // #654 — 유지한 사용자 수정본별 { filename, incoming, added, removed }
+  const deployValues = new Map(); // Map<type, Map<key,value>> — deploy 블록용 ask 값
+  counters.deployValues = deployValues;
+  // 브랜치 전략 (#477) — 표준(main/develop)이면 치환·가상비교 모두 no-op
+  const branches = { defaultBranch: branch || "main", deployBranch: deployBranch || "develop" };
+  // values/useDefaults는 치환 경로에서만 의미 (isUnchanged는 내부에서 useDefaults:true 강제 — 가상 비교 무손상)
+  const envOptsFor = (type) => ({ type, projectPath: paths.get(type) || ".", repoName, resolvers, values: envValues, useDefaults: envUseDefaults, branches });
+
+  // 설치하지 않을 새 파일 (#810) — 깔 때마다 다시 생기던 것들.
+  //   excluded        : version.yml options.excluded_workflows 에 사용자가 적은 파일
+  //   deleted-by-user : 우리가 깐 기록(baseline)이 있는데 지금 없다 = 사용자가 지웠다 (.bak 은 우리가 치운 것이라 제외)
+  //   no-dev-branch   : 개발 브랜치가 원격에 확실히 없는데 그 브랜치에서만 도는 워크플로우
+  const notInstalled = [];
+  Object.defineProperty(counters, "notInstalled", { value: notInstalled, enumerable: false });
+  const excludedSet = new Set(context.excludedWorkflows || []);
+  const devName = branches.deployBranch;
+  let devMissing = null; // 필요할 때 한 번만 원격을 조회한다
+  const isDevMissing = () => {
+    if (devMissing === null) {
+      const st = devName === branches.defaultBranch ? null : branchStatus(targetRoot, devName);
+      devMissing = !!(st && st.isRepo && !st.local && st.remote === false);
+    }
+    return devMissing;
+  };
+  const skipNew = (srcDir, filename, group) => {
+    const dst = join(workflowsDir, filename);
+    if (existsSync(dst)) return false;
+    let reason = null;
+    if (excludedSet.has(filename)) reason = "excluded";
+    else if (baseline?.files?.[filename] && !existsSync(dst + ".bak")) reason = "deleted-by-user";
+    else if (onlyTriggersOnDevelop(readFileSync(join(srcDir, filename), "utf8")) && isDevMissing()) reason = "no-dev-branch";
+    if (!reason) return false;
+    const info = { filename, reason, incoming: "" };
+    try {
+      // 마음이 바뀌면 cp 한 번으로 되살릴 수 있게 렌더본을 incoming 에 남긴다
+      const rendered = substituteBranches(substituteEnv(readFileSync(join(srcDir, filename), "utf8"),
+        { ...envOptsFor(group.split("/")[0]), useDefaults: true }), branches);
+      info.incoming = saveIncoming(targetRoot, filename, rendered);
+    } catch { /* 안내만 빠진다 */ }
+    notInstalled.push(info);
+    trace?.event("copy", "not-installed", filename, { group, reason });
+    return true;
+  };
+  Object.defineProperty(counters, "skipNew", { value: skipNew, enumerable: false });
+
+  // 사용자 수정본을 유지할 때 새 템플릿 사본을 incoming에 남긴다 (#654).
+  // 실패는 경고 한 줄로 흡수한다 — 병합 안내 때문에 복사 전체가 죽으면 안 된다.
+  const onSkip = (srcDir, filename, type) => {
+    const info = { filename, incoming: "", added: null, removed: null };
+    try {
+      // 설치 때와 같은 렌더(기본값 치환 + 브랜치 치환)를 거쳐야 diff가 "진짜 차이"만 보여준다
+      const rendered = substituteBranches(
+        substituteEnv(readFileSync(join(srcDir, filename), "utf8"), { ...envOptsFor(type), useDefaults: true }), branches);
+      info.incoming = saveIncoming(targetRoot, filename, rendered);
+      const d = lineDiffCounts(readFileSync(join(workflowsDir, filename), "utf8"), rendered);
+      info.added = d.added; info.removed = d.removed;
+    } catch (e) {
+      trace?.event("copy", "incoming-failed", filename, { message: e?.message || String(e) });
+      console.error(`⚠️ incoming 저장 실패(${filename}): ${e?.message || e} — 병합 안내 없이 계속합니다.`);
+    }
+    counters.skippedConflicts.push(info);
+    return info;
+  };
+  // 반환 객체의 열거 가능한 필드를 늘리지 않는다 (기존 호출부·테스트가 counters 모양에 기대고 있다)
+  Object.defineProperty(counters, "onSkip", { value: onSkip, enumerable: false });
+
+  // (1) common — 타입별과 동일한 판정·보호를 받는다 (#560).
+  // 릴리스 파이프라인처럼 프로젝트마다 뒤에 붙일 일이 다른 워크플로우는 common 이어도 사용자가 고쳐 쓴다.
+  // 그래서 수정본을 무조건 덮어쓰지 않고 타입별과 같은 충돌 판정·백업을 거친다.
+  const commonDir = join(projectTypesDir, "common");
+  if (exists(commonDir)) {
+    const commonEnv = envOptsFor("common");
+    const commonClass = classify(commonDir, workflowsDir, commonEnv, baseline);
+    for (const filename of listYamlFiles(commonDir)) {
+      // #491 — util 동기화 워크플로우는 util 모듈이 있(게 되)는 레포에만 복사
+      if (filename === UTIL_VERSION_SYNC && !utilSyncApplies(tempDir, targetRoot, types)) {
+        trace?.event("copy", "excluded", filename, { reason: "util-modules-absent" });
+        continue;
+      }
+      if (commonClass.unchanged.includes(filename)) {
+        counters.skipped++;
+        trace?.event("copy", "skipped-unchanged", filename, { group: "common" });
+        continue;
+      }
+      // 사용자가 손댄 적 없고 템플릿만 바뀐 파일 — 물어볼 것 없이 최신으로 올린다(종전과 동일).
+      if (commonClass.newFiles.includes(filename) && skipNew(commonDir, filename, "common")) continue;
+      if (commonClass.newFiles.includes(filename) || commonClass.upstream.includes(filename)) {
+        copyFileSync(join(commonDir, filename), join(workflowsDir, filename));
+        counters.copied++;
+        counters.copiedFiles.push(filename);
+        trace?.event("copy", commonClass.upstream.includes(filename) ? "upstream-updated" : "copied",
+                     filename, { group: "common" });
+        continue;
+      }
+      // 여기부터는 changed — "지금 템플릿 렌더 결과 ≠ 설치본"이다. 둘로 갈린다.
+      const dst = join(workflowsDir, filename);
+      const modified = isUserModified(baseline, filename, readFileSync(dst, "utf8"));
+      if (modified === null) {
+        // 판정 불가(기준점 없음 = 기존 통합 레포). common의 종전 계약은 "항상 최신으로 갱신"이라
+        // 여기서 skip하면 기존 레포가 업데이트를 영영 못 받는다. 계약은 지키되 되돌릴 수단을
+        // 남긴다 — 덮어쓰기 전 .bak. (#560: common/deploy조차 .bak을 남기는데 본체만 없었다)
+        renameSync(dst, dst + ".bak");
+        copyFileSync(join(commonDir, filename), dst);
+        counters.copied++;
+        counters.copiedFiles.push(filename);
+        trace?.event("copy", "replaced-bak", filename, { group: "common", reason: "baseline-absent" });
+        counters.replacedBak.push(filename);   // #673 — 수정 가능성이 있는 파일을 교체했음을 화면에 알린다
+        continue;
+      }
+      // 사용자가 손댄 것이 확인된 파일 — 결정에 따라 처리(미지정이면 유지).
+      applyDecision(decisions.get(filename), commonDir, workflowsDir, filename, counters, trace, "common");
+    }
+  }
+
+  // (2~4) 타입별
+  for (const type of types) {
+    const asks = new Map();
+    copyWorkflowsForType(type, projectTypesDir, workflowsDir, { deployTarget, publishTargets, ...context, envOptsFor, collectAsks: asks, decisions, trace, baseline }, counters);
+    if (asks.size) deployValues.set(type, asks);
+  }
+
+  // (4.5~5) common/ 아래 선택형 폴더 — deploy/<target>, pr-summary, projects-sync, secret-backup.
+  // 어느 폴더를 켜는지는 workflow-groups.js 한 곳이 정한다 (#851). 고아 감지도 같은 표를 쓴다.
+  //   bak-replace: 템플릿과 같으면 건너뛰고, 다르면 .bak 으로 남기고 교체한다.
+  //   new-only   : 이미 있으면 건드리지 않는다. 새로 깔 때만 레포 이름을 채운다 (#729 — 고정값이면
+  //                모든 프로젝트가 서버의 같은 폴더에 Secret 을 덮어쓴다).
+  for (const group of commonOptionalGroups(commonDir, { includeSecretBackup, aiPrSummary, projectsSync, deployTarget })) {
+    const groupDir = join(commonDir, group.dir);
+    if (!group.enabled || !exists(groupDir)) continue;
+    for (const filename of listYamlFiles(groupDir)) {
+      const src = join(groupDir, filename);
+      const dst = join(workflowsDir, filename);
+      if (group.policy === "new-only") {
+        if (existsSync(dst)) continue;
+        if (skipNew(groupDir, filename, group.copyLabel)) continue;
+        copyFileSync(src, dst);
+        const raw = readFileSync(dst, "utf8");
+        const filled = resolveGlobalTokens(raw, repoName || "my-project");
+        if (filled !== raw) writeFileSync(dst, filled);
+        counters.optionalCopied++;
+        counters.copied++;
+        counters.copiedFiles.push(filename);
+        trace?.event("copy", "copied", filename, { group: group.copyLabel });
+        continue;
+      }
+      if (existsSync(dst) && isUnchanged(readFileSync(src, "utf8"), readFileSync(dst, "utf8"), envOptsFor("common"))) {
+        counters.skipped++;
+        trace?.event("copy", "skipped-unchanged", filename, { group: group.copyLabel });
+        continue;
+      }
+      if (skipNew(groupDir, filename, group.copyLabel)) continue;
+      const backedUp = existsSync(dst);
+      if (backedUp) renameSync(dst, dst + ".bak");
+      copyFileSync(src, dst);
+      counters.optionalCopied++;
+      counters.copied++;
+      counters.copiedFiles.push(filename);
+      trace?.event("copy", backedUp ? "replaced-bak" : "copied", filename, { group: group.copyLabel });
+      if (backedUp) counters.replacedBak.push(filename);   // #673
+    }
+  }
+
+  // (6) 브랜치 치환 post-pass (#477) — 표준과 다른 브랜치 전략일 때만 복사된 파일에 적용.
+  // isUnchanged 가상 비교에도 같은 branches가 들어가므로 다음 업데이트에서 재복사 churn이 없다.
+  if (branches.defaultBranch !== "main" || branches.deployBranch !== "develop") {
+    for (const f of counters.copiedFiles) {
+      const p = join(workflowsDir, f);
+      if (!existsSync(p)) continue;
+      const before = readFileSync(p, "utf8");
+      const after = substituteBranches(before, branches);
+      if (after !== before) {
+        writeFileSync(p, after);
+        trace?.event("env", "branch-substituted", f, { defaultBranch: branches.defaultBranch, deployBranch: branches.deployBranch });
+      }
+    }
+  }
+
+  // (7) 기준점 기록 (#557) — 다음 업데이트가 "누가 바꿨는지"를 가릴 근거.
+  //     이번에 실제로 쓴 파일만 installed를 갱신한다. 유지(skip)한 파일에 우리가 쓴 것처럼
+  //     기록하면 다음 업데이트에서 사용자 수정이 조용히 덮인다.
+  recordBaseline(workflowsDir, targetRoot, counters, baseline, context.templateVersion, context.now, trace);
+
+  return counters;
+}
+
+// 설치 직후의 디스크 내용을 기준점으로 남긴다. 실패해도 통합을 막지 않는다 —
+// 기준점이 없으면 다음 업데이트가 종전 2-way 판정으로 폴백할 뿐이다.
+function recordBaseline(workflowsDir, targetRoot, counters, previous, templateVersion, now, trace = null) {
+  try {
+    const entries = new Map();
+    for (const f of counters.copiedFiles || []) {
+      const p = join(workflowsDir, f);
+      if (!existsSync(p)) continue;
+      const content = readFileSync(p, "utf8");
+      // 치환까지 끝난 최종 디스크 내용이 곧 우리가 쓴 것이자, 이 시점의 렌더 결과다.
+      entries.set(f, { installed: sha256(content), rendered: sha256(content) });
+    }
+    if (entries.size === 0 && previous) return; // 새로 쓴 게 없으면 기존 기준점을 건드리지 않는다
+    trace?.event("baseline", "recorded", "", { files: entries.size, hadPrevious: !!previous });
+    writeBaseline(targetRoot, {
+      templateVersion: templateVersion || "unknown",
+      installedAt: now || "",
+      entries,
+      previous,
+    });
+  } catch {
+    // 기준점 기록 실패는 통합 실패가 아니다
+  }
+}
+
+// changed(기존에 있고 내용이 바뀐) 파일 1개를 결정에 따라 처리 (3지선: 백업 교체·템플릿 사본·유지).
+// 'skip'(기본): 기존 유지. 'backup': 기존→.bak 후 교체. 'template': 기존 유지 + 새 버전을 .template.yaml로.
+function applyDecision(decision, srcDir, workflowsDir, filename, counters, trace = null, type = "") {
+  const src = join(srcDir, filename);
+  const dst = join(workflowsDir, filename);
+  if (decision === "backup") {
+    // 백업 교체: 기존을 .bak으로 백업 후 새 버전으로 교체
+    renameSync(dst, dst + ".bak");
+    copyFileSync(src, dst);
+    counters.copied++;
+    counters.copiedFiles?.push(filename);
+    trace?.event("copy", "replaced-bak", filename, { decision });
+    return;
+  }
+  if (decision === "template") {
+    // 템플릿 사본: `<이름>.template.yaml` — .yaml만 strip (.yml은 그대로 뒤에 붙음)
+    const templateName = (filename.endsWith(".yaml") ? filename.slice(0, -".yaml".length) : filename) + ".template.yaml";
+    copyFileSync(src, join(workflowsDir, templateName)); // 기존 .template.yaml 덮어씀
+    counters.templateAdded++;
+    trace?.event("copy", "template-added", templateName, { original: filename });
+    return;
+  }
+  counters.skipped++; // 'skip'/미지정/ESC → 기존 유지 (force 기본)
+  // #654 — 새 템플릿을 incoming에 남기고 diff 줄 수를 detail로 함께 기록
+  const inc = counters.onSkip?.(srcDir, filename, type) ?? {};
+  trace?.event("copy", "skipped-conflict", filename, {
+    decision: decision ?? "skip", note: "사용자 수정본 유지 — 병합 검토 후보",
+    incoming: inc.incoming || null, added: inc.added ?? null, removed: inc.removed ?? null,
+  });
+}
+
+// 대상 워크플로우 디렉토리에서 changed(충돌) 파일 목록만 뽑는다 — 마법사(commands/interactive.js)와 copyWorkflowsInteractive 가 쓴다.
+// copyWorkflows 본체와 동일한 classify 기준을 써야 결정 Map이 실제 처리 대상과 1:1로 맞는다.
+export function listWorkflowConflicts(context, tempDir, targetRoot = ".") {
+  const { types = [], paths = new Map(), deployTarget = "docker-ssh", repoName = "", resolvers = {}, branch = "", deployBranch = "" } = context;
+  const workflowsDir = join(targetRoot, PATHS.workflowsDir);
+  // 설치 시점 기준점(#557) — 없으면 null이고 classify가 종전 2-way로 폴백한다.
+  const baseline = readBaseline(targetRoot);
+  const projectTypesDir = join(tempDir, PATHS.workflowsDir, PATHS.projectTypesDir);
+  const conflicts = []; // [{ filename, type }] — 엔진 처리 순서와 동일 (common → 타입 순회 → server-deploy)
+  const branches = { defaultBranch: branch || "main", deployBranch: deployBranch || "develop" }; // #477 — 엔진과 동일 기준
+
+  // common (#560) — 사용자가 손댄 것이 "확인된" 파일만 질문 대상이다.
+  // 기준점이 없어 판정 불가인 파일은 엔진이 .bak을 남기고 덮어쓰므로 질문하지 않는다.
+  const commonDir = join(projectTypesDir, "common");
+  if (exists(commonDir)) {
+    const commonEnv = { type: "common", projectPath: ".", repoName, resolvers, branches };
+    for (const f of classify(commonDir, workflowsDir, commonEnv, baseline).changed) {
+      const dst = join(workflowsDir, f);
+      if (!existsSync(dst)) continue;
+      if (isUserModified(baseline, f, readFileSync(dst, "utf8")) !== true) continue;
+      conflicts.push({ filename: f, type: "common" });
+    }
+  }
+
+  for (const type of types) {
+    const envOpts = { type, projectPath: paths.get(type) || ".", repoName, resolvers, branches };
+    const typeDir = join(projectTypesDir, type);
+    if (exists(typeDir)) {
+      for (const f of classify(typeDir, workflowsDir, envOpts, baseline).changed) conflicts.push({ filename: f, type });
+    }
+    const serverDeployDir = join(typeDir, SERVER_DEPLOY_DIR);
+    if (exists(serverDeployDir) && serverDeployEnabled(deployTarget)) {
+      for (const f of classify(serverDeployDir, workflowsDir, envOpts, baseline).changed) conflicts.push({ filename: f, type });
+    }
+  }
+  return conflicts;
+}
+
+// 대화형 진입점 (async) — 충돌마다 onConflict(filename, type)를 await해 결정 Map을 만든 뒤
+// 동기 엔진에 위임한다. WHY 분리: copyWorkflows를 async로 바꾸면 await 없이 호출하는
+// 기존 호출부(runFull/runWorkflows)가 깨진다 — 시그니처 무변경 원칙.
+// onConflict 반환값: 'template' | 'skip' | 'backup' (그 외/미지정 → 'skip').
+export async function copyWorkflowsInteractive(context, tempDir, targetRoot = ".", { onConflict } = {}) {
+  const decisions = new Map();
+  if (typeof onConflict === "function") {
+    for (const { filename, type } of listWorkflowConflicts(context, tempDir, targetRoot)) {
+      if (decisions.has(filename)) continue; // 파일명은 PROJECT-{TYPE}- prefix로 타입 간 유일
+      decisions.set(filename, await onConflict(filename, type));
+    }
+  }
+  return copyWorkflows(context, tempDir, targetRoot, { decisions });
+}
+
+
+function copyWorkflowsForType(type, projectTypesDir, workflowsDir, ctx, counters) {
+  const { deployTarget = "docker-ssh", publishTargets = [], force = false, paths = new Map(), repoName = "", resolvers = {}, envOptsFor, collectAsks = null, decisions = new Map(), trace = null, baseline = null } = ctx;
+  const typeDir = join(projectTypesDir, type);
+  const envOpts = envOptsFor(type);
+  let unchangedNames = [];
+  // upstream 갱신 전 설치본의 env 실값 (#810 조사 중 발견). 템플릿만 바뀐 파일을 새로 깔 때
+  // 기본값으로 다시 치환해, 사용자가 고른 값(JAVA_VERSION 17 등)이 조용히 21로 돌아갔다.
+  const carried = new Map(); // Map<filename, Map<key,value>>
+  const upstreamCopy = (srcDir, f, group) => {
+    const dst = join(workflowsDir, f);
+    try { carried.set(f, extractEnvValues(readFileSync(dst, "utf8"))); } catch { /* 읽기 실패 — 기본값으로 */ }
+    copyFileSync(join(srcDir, f), dst);
+    counters.copied++; counters.copiedFiles.push(f);
+    trace?.event("copy", "upstream-updated", f, { group, reason: "baseline-match", carried: carried.get(f)?.size ?? 0 });
+  };
+
+  // 타입별 워크플로우 (직하위)
+  if (exists(typeDir)) {
+    const { newFiles, unchanged, changed, upstream } = classify(typeDir, workflowsDir, envOpts, baseline);
+    unchangedNames = unchanged.slice();
+    for (const f of unchanged) { counters.skipped++; trace?.event("copy", "skipped-unchanged", f, { group: type }); }
+    for (const f of newFiles) { if (counters.skipNew(typeDir, f, type)) continue; copyFileSync(join(typeDir, f), join(workflowsDir, f)); counters.copied++; counters.copiedFiles.push(f); trace?.event("copy", "copied", f, { group: type }); }
+    // upstream(#557): 사용자가 손대지 않았고 템플릿만 바뀐 파일 — 물어볼 것 없이 최신으로 올린다.
+    for (const f of upstream) upstreamCopy(typeDir, f, type);
+    // changed: 결정 Map에 따라 처리 (미지정=skip → 현행 force 동작과 동일)
+    for (const f of changed) applyDecision(decisions.get(f), typeDir, workflowsDir, f, counters, trace, type);
+  }
+
+  // server-deploy — deploy=docker-ssh일 때만 포함 (#439)
+  const serverDeployDir = join(typeDir, SERVER_DEPLOY_DIR);
+  if (exists(serverDeployDir) && serverDeployEnabled(deployTarget)) {
+    const { newFiles, unchanged, changed, upstream } = classify(serverDeployDir, workflowsDir, envOpts, baseline);
+    for (const f of unchanged) { counters.skipped++; trace?.event("copy", "skipped-unchanged", f, { group: `${type}/server-deploy` }); }
+    for (const f of newFiles) { if (counters.skipNew(serverDeployDir, f, `${type}/server-deploy`)) continue; copyFileSync(join(serverDeployDir, f), join(workflowsDir, f)); counters.copied++; counters.copiedFiles.push(f); trace?.event("copy", "copied", f, { group: `${type}/server-deploy` }); }
+    for (const f of upstream) upstreamCopy(serverDeployDir, f, `${type}/server-deploy`);
+    for (const f of changed) applyDecision(decisions.get(f), serverDeployDir, workflowsDir, f, counters, trace, type);
+  }
+
+  // publish/<target> (opt-in — #439 publish 축. 타입은 파일 위치일 뿐 게이트가 아니다)
+  const pubDirs = [];
+  for (const target of PUBLISH_TARGETS) {
+    const pubDir = join(typeDir, "publish", target);
+    pubDirs.push(pubDir);
+    if (!exists(pubDir) || !publishTargets.includes(target)) continue;
+    for (const filename of listYamlFiles(pubDir)) {
+      const src = join(pubDir, filename);
+      const dst = join(workflowsDir, filename);
+      if (existsSync(dst) && isUnchanged(readFileSync(src, "utf8"), readFileSync(dst, "utf8"), envOpts)) {
+        counters.skipped++;
+        trace?.event("copy", "skipped-unchanged", filename, { group: `${type}/publish/${target}` });
+        continue;
+      }
+      if (counters.skipNew(pubDir, filename, `${type}/publish/${target}`)) continue;
+      const backedUp = existsSync(dst);
+      if (backedUp) renameSync(dst, dst + ".bak");
+      copyFileSync(src, dst);
+      counters.optionalCopied++;
+      counters.copied++;
+      counters.copiedFiles.push(filename);
+      trace?.event("copy", backedUp ? "replaced-bak" : "copied", filename, { group: `${type}/publish/${target}` });
+      if (backedUp) counters.replacedBak.push(filename);   // #673
+    }
+  }
+
+  // env 치환 — 이 타입의 원본 디렉토리들에서 복사돼 존재하고 unchanged 아닌 파일만
+  for (const srcDir of [typeDir, serverDeployDir, ...pubDirs]) {
+    if (!exists(srcDir)) continue;
+    for (const filename of listYamlFiles(srcDir)) {
+      const target = join(workflowsDir, filename);
+      if (!existsSync(target)) continue;            // 건너뛴 파일 제외
+      if (unchangedNames.includes(filename)) continue; // unchanged 제외
+      const prev = carried.get(filename);
+      if (prev && prev.size) {
+        // 이월값 위에 이번 실행에서 명시로 고른 값을 덮는다 (명시 선택이 이긴다)
+        const values = new Map([...prev, ...(envOpts.useDefaults ? [] : envOpts.values)]);
+        configureEnv(target, filename, { ...envOpts, values, useDefaults: false, collectAsks, trace });
+      } else {
+        configureEnv(target, filename, { ...envOpts, collectAsks, trace }); // env 계획 values/useDefaults 포함
+      }
+    }
+  }
+}

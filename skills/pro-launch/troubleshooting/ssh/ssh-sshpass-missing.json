@@ -1,0 +1,23 @@
+{
+  "id": "ssh-sshpass-missing",
+  "area": "ssh",
+  "title": "Password ssh returns sshpass_missing — use a key or the fallback path",
+  "match": {
+    "codes": [
+      "sshpass_missing"
+    ],
+    "keywords": []
+  },
+  "symptom": "launch_cli.py ssh ends with sshpass_missing (password logins need sshpass)",
+  "cause": "The saved server uses password login, but sshpass is not installed. Key login (key_path) does not need sshpass",
+  "fix": [
+    "With a key: launch_cli.py ssh --cred <server> --key-path <key file> --command '<command>'",
+    "Ask the user before installing sshpass: brew install hudochenkov/sshpass/sshpass",
+    "Where it cannot be installed (Windows, etc.), use pro-ssh's scripts/ssh_connect.py (paramiko) — skills/pro-ssh/SKILL.md"
+  ],
+  "refs": [
+    841,
+    889
+  ],
+  "verified_at": "2026-10-17"
+}

@@ -1,0 +1,379 @@
+// projectops CLI 진입 파이프라인 (인자 > 감지 > 모드별 통합 > 요약).
+// 감지 → 다운로드 → 모드 라우팅 → 통합 실행 → 정리. 비대화형(--force) 우선.
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import { readFileSync, existsSync } from "node:fs";
+import { parseArgs, parsePathsCsv, validatePathsMap, CliError } from "./cli/args.js";
+import { helpText } from "./cli/help.js";
+import { resolveLang, setLang, t } from "./i18n/index.js";
+import { reportFatal } from "./cli/errors.js";
+import { createContext } from "./context.js";
+import { PATHS } from "./core/paths.js";
+import { remove } from "./core/fsutil.js";
+import { acquireTemplate, readTemplateVersion } from "./core/assets.js";
+import { detectTypes, detectVersion, detectDefaultBranch, detectRepoName, makeResolvers } from "./core/detect-fs.js";
+import { parseExisting } from "./core/version-yml.js";
+import { runBreakingCheck } from "./core/breaking-check.js";
+import { runMigrations } from "./core/migrations/index.js";
+import { detectOrphanWorkflows } from "./core/orphan-workflows.js";
+import { createRunTrace, MIGRATION_DIR } from "./core/run-trace.js";
+import { appendGuideEntry } from "./core/migration-guide.js";
+import { resolveProjectPaths, markerForType } from "./core/paths-resolve.js";
+import { resolveOptions } from "./core/resolve-options.js";
+import { runDevelopmentBranchStep } from "./core/development-branch.js";
+import { printBannerCompact } from "./ui/banner.js";
+import { printSummary } from "./ui/summary.js";
+import { runFull } from "./commands/full.js";
+import { runVersion } from "./commands/version.js";
+import { runWorkflows } from "./commands/workflows.js";
+import { runIssues } from "./commands/issues.js";
+import { runInteractive } from "./commands/interactive.js";
+import { runSkills } from "./commands/skills.js";
+
+// projectops 패키지 버전 읽기 (-v/--version 출력용). src/../package.json.
+function readPkgVersion() {
+  try {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const pkg = JSON.parse(readFileSync(join(here, "..", "package.json"), "utf8"));
+    return pkg.version || "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+// 결정적 UTC 타임스탬프 (주입 가능 — 테스트/골든용)
+function utcNow(date = new Date()) {
+  const p = (n) => String(n).padStart(2, "0");
+  const d = `${date.getUTCFullYear()}-${p(date.getUTCMonth() + 1)}-${p(date.getUTCDate())}`;
+  const t = `${p(date.getUTCHours())}:${p(date.getUTCMinutes())}:${p(date.getUTCSeconds())}`;
+  return { now: `${d} ${t}`, today: d };
+}
+
+// run(argv, opts) → exitCode. opts: { cwd, source?, clock? }
+//   source: acquireTemplate용 (기본 git clone). 테스트는 {type:'local', path} 주입.
+//   clock: {now, today} 주입 (기본 현재 UTC).
+export async function run(argv, options = {}) {
+  try {
+    return await runCore(argv, options);
+  } catch (err) {
+    // 네트워크·git·권한 같은 환경 문제는 스택 트레이스 대신 한 줄 원인 + 조치로 알린다 (#672).
+    // 실행 기록(trace)은 runCore 의 finally 에서 이미 닫혔다.
+    reportFatal(err);
+    return 1;
+  }
+}
+
+async function runCore(argv, { cwd = process.cwd(), source = { type: "git" }, clock } = {}) {
+  let opts;
+  try {
+    opts = parseArgs(argv);
+  } catch (e) {
+    if (e instanceof CliError) { console.error(e.message); return 1; }
+    throw e;
+  }
+  // Language: --lang > PROJECTOPS_LANG > system. Non-interactive runs are pinned to English
+  // so logs do not depend on the runner's locale.
+  const langInfo = resolveLang({ flag: opts.lang, pinEnglish: opts.force || !process.stdout.isTTY });
+  setLang(langInfo.lang, langInfo.source);
+  if (opts.showVersion) { console.log(readPkgVersion()); return 0; }
+  if (opts.help) { console.log(helpText()); return 0; }
+
+  // options 모드 — 옵션 정본 출력. AI agent 가 문서를 뒤지지 않고 한 번에 읽는다. 읽기 전용·네트워크 없음.
+  if (opts.mode === "options") {
+    const { buildSchema, renderText } = await import("./core/options-schema.js");
+    const schema = buildSchema(readPkgVersion());
+    console.log(opts.json ? JSON.stringify(schema, null, 2) : renderText(schema));
+    return 0;
+  }
+
+  // doctor 모드 (#558) — 읽기 전용 진단. 템플릿을 내려받지 않으므로 네트워크 없이도 동작한다.
+  if (opts.mode === "doctor") {
+    const { runDoctor } = await import("./commands/doctor.js");
+    await runDoctor({ cwd });
+    return 0;   // 진단은 실패가 아니다 — 살펴볼 항목이 있어도 0으로 끝낸다
+  }
+
+  // skills 모드 — IDE 스킬 설치/업데이트/제거 (템플릿 통합 없음).
+  // Cursor 복사용 skills/ 소스가 필요하므로 템플릿을 획득한 뒤 실행한다.
+  if (opts.mode === "skills") {
+    const tempDir = join(cwd, PATHS.tempDir);
+    const interactive = !opts.force && process.stdout.isTTY;
+    try {
+      acquireTemplate({ tempDir, source });
+      const templateVersion = readTemplateVersion(tempDir);
+      return await runSkills({ templateVersion, tempDir, interactive });
+    } finally {
+      remove(tempDir);
+    }
+  }
+  // 대화형 모드 — 인자 없이 실행 or --mode interactive
+  if (opts.mode === "interactive") {
+    if (!process.stdout.isTTY) {
+      console.error(t("cli.nonTty"));
+      return 1;
+    }
+    return await runInteractive({}, { cwd, source, clock });
+  }
+  // 명시 모드인데 --force 없으면 (비대화형 CLI는 --force 필요)
+  if (!opts.force && !process.stdout.isTTY) {
+    console.error(t("cli.needForce"));
+    return 1;
+  }
+
+  // 실행 트레이스 (#494/#561) — 감지·판단 단계부터 기록해야 "왜 이렇게 정해졌는지"가 남는다.
+  const trace = createRunTrace();
+  const recordArtifacts = opts.mode === "full" || opts.mode === "workflows";
+  let disarmSignals = () => {};
+  if (recordArtifacts) {
+    trace.mirrorStart();
+    // Ctrl+C로 끊어도 여기까지의 기록이 남는다 (#561). 경로는 아래에서 확정되지만
+    // 신호는 언제든 올 수 있으므로 targetRoot만으로 먼저 무장한다.
+    disarmSignals = trace.armSignals({ targetRoot: cwd, now: "" });
+  }
+
+  // 기존 version.yml 로드 — version/version_code/project_paths 보존의 단일 진실
+  const vyPath = join(cwd, "version.yml");
+  const existing = existsSync(vyPath) ? parseExisting(readFileSync(vyPath, "utf8")) : null;
+  trace.event("detect", "existing-install", existing ? "found" : "none", {
+    templateVersion: existing?.templateVersion || null,
+    version: existing?.version || null,
+    types: existing?.types || null,
+  });
+
+  // 감지 (CLI 인자 우선, 없으면 자동 감지 — version.yml 우선 규칙은 detectTypes/detectVersion 내부)
+  const types = opts.types.length ? opts.types : detectTypes(cwd);
+  trace.event("detect", "types", types.join(",") || "(none)", {
+    source: opts.types.length ? "cli-flag(--type)" : "auto-detect(marker file scan)",
+  });
+  // version: 기존 version.yml 최우선(SSoT — 재실행 시 덮어쓰기 방지) → CLI 지정 → 파일 감지
+  const version = (existing?.version) || opts.version || detectVersion(cwd);
+  trace.event("detect", "version", version, {
+    source: existing?.version ? "version.yml(existing value kept)"
+      : (opts.version ? "cli-flag(--project-version)" : "project file detection"),
+  });
+  const versionCode = existing?.versionCode ?? 1; // 기존 빌드번호 보존
+  const branch = detectDefaultBranch(cwd);
+  const repoName = detectRepoName(cwd);
+  trace.event("detect", "repo", repoName || "(unknown)", { defaultBranch: branch, versionCode });
+  // 경로 확정 (비대화형 — --paths 우선 → 저장값 → 후보 1개 자동 → 루트 폴백)
+  let cliPaths;
+  try {
+    cliPaths = parsePathsCsv(opts.pathsCsv);
+    validatePathsMap(cliPaths, { root: cwd, types });   // #674 — 파일을 쓰기 전에 거른다
+  } catch (e) {
+    if (e instanceof CliError) {
+      console.error(e.message);
+      trace.mirrorStop();
+      disarmSignals();
+      return 1;
+    }
+    throw e;
+  }
+  const paths = await resolveProjectPaths({
+    root: cwd, types, paths: cliPaths,
+    existingPaths: existing?.paths ?? new Map(), force: true, tty: false, io: {},
+  });
+
+  for (const [ty, pth] of paths) {
+    // 근거로 "무엇을 보고 그 경로로 정했는지"까지 남긴다 — 경로가 틀렸을 때 추적의 시작점이다.
+    const marker = markerForType(ty);
+    const at = pth === "." ? marker : `${pth}/${marker}`;
+    trace.event("detect", "project-path", ty, {
+      path: pth,
+      marker: existsSync(join(cwd, at)) ? at : `${at} (missing)`,
+      source: parsePathsCsv(opts.pathsCsv).has(ty) ? "cli-flag(--paths)"
+        : (existing?.paths?.has(ty) ? "version.yml(stored value)" : "marker file search"),
+    });
+  }
+
+  const { now, today } = clock || utcNow();
+  const tempDir = join(cwd, PATHS.tempDir);
+
+  // 옵션 값은 resolve-options.js 한 곳에서 정한다 (#851) — 대화형과 같은 규칙.
+  const { values: resolved, sources } = resolveOptions({
+    flags: {
+      intent: opts.intent, deployTarget: opts.deployTarget, publishTargets: opts.publishTargets,
+      includeSecretBackup: opts.includeSecretBackup, aiPrSummary: opts.aiPrSummary, projectsSync: opts.projectsSync,
+      deployBranch: opts.deployBranch, codeReviewCoderabbit: opts.codeReviewCoderabbit,
+      language: opts.language, labelStyle: opts.labelStyle,
+    },
+    existing, types, cwd,
+  });
+  const { intent, deployTarget, publishTargets } = resolved;
+  const { before: beforeCleanup, applicable } = sources;
+
+  // 축 확정 근거 (#561) — "왜 이 값인가"가 가장 헷갈리는 자리다.
+  // CLI 플래그 / 저장값 / intent 유도 / 타입 적용성 정리 중 무엇이 이겼는지 남긴다.
+  trace.event("resolve", "intent", String(intent ?? "(unset)"), { source: sources.intent });
+  trace.event("resolve", "deploy", deployTarget, {
+    source: sources.deploy,
+    applicableForTypes: applicable.deploy,
+    adjusted: beforeCleanup.deploy !== deployTarget
+      ? `${beforeCleanup.deploy} → ${deployTarget} (not applicable to the selected types)` : null,
+  });
+  trace.event("resolve", "publish", publishTargets.join(",") || "(none)", {
+    source: sources.publish,
+    applicableForTypes: applicable.publish,
+    adjusted: beforeCleanup.publish.join(",") !== publishTargets.join(",")
+      ? `${beforeCleanup.publish.join(",") || "(none)"} → ${publishTargets.join(",") || "(none)"} (cleaned up, not applicable)` : null,
+  });
+
+  const context = createContext({
+    mode: opts.mode, force: true, types, version, versionCode, branch, paths,
+    ...resolved,
+    repoName,
+    // 실 resolver 4종 (spring-app-yml 포함)
+    resolvers: makeResolvers(cwd, repoName, paths),
+    now, today,
+  });
+
+  // 최종 확정값 스냅샷 (#561) — 이 한 줄로 "무엇이 어떻게 설치될 것인지"가 고정된다.
+  trace.event("resolve", "context", opts.mode || "", {
+    types, version, versionCode, branch,
+    deploy: deployTarget, publish: publishTargets, intent,
+    secretBackup: context.includeSecretBackup,
+    changelogProvider: context.changelogProvider,
+    coderabbit: context.codeReviewCoderabbit,
+    deployBranch: context.deployBranch || "(not given, falls back to develop)",
+    recordMode: context.recordMode,
+  });
+  trace.event("resolve", "semver-auto", String(context.semverAuto), {
+    reason: existing?.options?.semverAuto != null ? "stored value in version.yml kept"
+      : (existing ? "existing integrated repo without the key, turned on by default (announced in the summary)"
+                  : "new integration, true"),
+  });
+  trace.event("resolve", "app-release", String(context.appRelease), {
+    reason: existing?.options?.appRelease != null ? "stored value in version.yml kept" : "unset (key not written)",
+  });
+
+  let result = null;
+  // trace/recordArtifacts는 감지 단계 기록을 위해 위에서 이미 생성했다 (#561)
+  let breakingReport = null;
+  let migrationsResult = null;
+  let orphanPending = [];
+  // 실행 경계(#561) — 로그만 보고 "무엇을 어떤 인자로 돌렸는지"를 알 수 있어야 한다.
+  trace.event("run", "start", opts.mode || "", {
+    cli: "non-interactive", types, version, branch,
+    force: true, deploy: deployTarget, publish: publishTargets, intent,
+  });
+  try {
+    trace.step("acquire-template", () => acquireTemplate({ tempDir, source }), { source: source?.type || "git" });
+    context.templateVersion = readTemplateVersion(tempDir);
+    trace.event("detect", "template-version", context.templateVersion, { tempDir: PATHS.tempDir });
+
+    // 비대화형 축약 배너 (#446 확정 — 1줄, 로그 오염 최소)
+    printBannerCompact({ version: context.templateVersion, mode: opts.mode });
+
+    // Breaking Changes 게이트 (비대화형은 경고 후 진행)
+    const proceed = await trace.stepAsync("breaking-check", () => runBreakingCheck({
+      cwd, tempDir, templateVersion: context.templateVersion,
+      onItems: (items) => { breakingReport = items; },
+    }));
+    trace.event("breaking", "result", proceed ? "proceed" : "halt", { items: (breakingReport ?? []).length });
+    if (!proceed) {
+      trace.event("run", "cancelled", "breaking-gate", { reason: "stopped by breaking-change warning" });
+      return 0;
+    }
+
+    // 레거시 마이그레이션 (#470) — 워크플로우를 만지는 모드에서만. 비대화형은 safe 티어 자동 적용.
+    if (recordArtifacts) {
+      migrationsResult = await trace.stepAsync("legacy-migrations", () => runMigrations({ targetRoot: cwd, removeLegacy: opts.removeLegacy === true }));
+      for (const a of migrationsResult.applied ?? []) trace.event("legacy", a.action === "error" ? "error" : "neutralized", a.from ?? a.id ?? "", { to: a.to ?? "", id: a.id ?? "" });
+      for (const e of migrationsResult.confirmPending ?? []) trace.event("legacy", "leftover-old-gen", e.file, { replacement: e.replacedBy ?? "", reason: e.reason ?? "" });
+    }
+
+    // 고아 타입 워크플로우 안내 (#487) — 비대화형은 자동 무해화 금지(배포 파이프라인일 수 있음), 안내만
+    if (recordArtifacts) {
+      const orphans = trace.step("orphan-scan",
+        () => detectOrphanWorkflows({ tempDir, targetRoot: cwd, selectedTypes: types,
+          // 껐는데 남아 계속 도는 워크플로우도 함께 잡는다 (#566)
+          options: { includeSecretBackup: context.includeSecretBackup, aiPrSummary: context.aiPrSummary, projectsSync: context.projectsSync, deployTarget } }),
+        { selectedTypes: types });
+      orphanPending = orphans.map((o) => o.filename);
+      for (const o of orphans) trace.event("orphan", "detected", o.filename, { type: o.type, action: "notice only (non-interactive)" });
+      for (const o of orphans) {
+        console.error(t("run.orphanNotice", { type: o.type, file: o.filename }));
+      }
+    }
+
+    switch (opts.mode) {
+      case "full": result = trace.step("install-full", () => runFull(context, tempDir, cwd, { trace })); break;
+      case "version": result = trace.step("install-version", () => runVersion(context, tempDir, cwd)); break;
+      case "workflows": result = trace.step("install-workflows", () => runWorkflows(context, tempDir, cwd, { trace })); break;
+      case "issues": result = trace.step("install-issues", () => runIssues(context, tempDir, cwd)); break;
+      default:
+        // 알 수 없는 모드 → 복사 0건, 에러 아님
+        break;
+    }
+    // 개발 브랜치 생성 (#715) — --create-development-branch 일 때만. 실패해도 실행은 계속(수동 명령 안내)
+    const developmentBranchResult = await runDevelopmentBranchStep({
+      isRequested: opts.createDevelopmentBranch === true, targetRoot: cwd,
+      branch: context.deployBranch || "develop", defaultBranch: branch, trace,
+      say: (line) => console.error(line),
+    });
+    const isDevelopmentBranchReady = developmentBranchResult ? developmentBranchResult.status !== "failed" : null;
+
+    // 마이그레이션 기록 (#493/#494) — Layer 2/3 트레이스 파일 + Layer 1 가이드 엔트리
+    let migrationGuidePath = null;
+    // 기록 파일 경로는 먼저 계산하고(가이드가 참조), 실제 쓰기는 완료 화면 출력 뒤로 미룬다 —
+    // 그래야 터미널 미러에 완료 화면까지 담긴다 (#561).
+    const files = recordArtifacts
+      ? trace.paths({ fromVersion: existing?.templateVersion || "", toVersion: context.templateVersion, now })
+      : null;
+    if (recordArtifacts) {
+      migrationGuidePath = appendGuideEntry(cwd, {
+        now, mode: opts.mode, types, repoName,
+        templateFrom: existing?.templateVersion || "", templateTo: context.templateVersion,
+        options: { deploy: deployTarget, publish: publishTargets, secretBackup: context.includeSecretBackup, coderabbit: context.codeReviewCoderabbit, changelogProvider: context.changelogProvider, intent, semverAuto: context.semverAuto , appRelease: context.appRelease, language: context.language, labelStyle: context.labelStyle, closeOnRelease: context.closeOnRelease, projectsSync: context.projectsSync, excludedWorkflows: context.excludedWorkflows, storeLocales: context.storeLocales, storeLocalesIos: context.storeLocalesIos, storeLocalesPlay: context.storeLocalesPlay },
+        branches: { defaultBranch: branch, deployBranch: context.deployBranch || "develop", ready: isDevelopmentBranchReady,
+          created: developmentBranchResult ? developmentBranchResult.status === "created" : null, result: developmentBranchResult },
+        breaking: breakingReport, migrations: migrationsResult, orphans: { cleaned: [], pending: orphanPending },
+        events: trace.events, counters: { skipped: result?.workflows?.skipped ?? 0 },
+        traceFile: files?.traceFile ?? "", logFile: files?.logFile ?? "",
+      }).guidePath;
+    }
+
+    // 완료 요약 (CLI 모드에서도 출력)
+    printSummary({
+      mode: opts.mode, types, version, deployBranch: context.deployBranch, migrationGuidePath,
+      developmentBranchResult,                                        // #715 생성 결과 (플래그 없으면 null)
+      shouldSuggestCreateBranchFlag: !developmentBranchResult,        // #715 플래그 없이 돌았으면 다음엔 쓰라고 안내
+      counters: { workflows: result?.workflows?.copied ?? 0, workflowFiles: result?.workflows?.copiedFiles ?? [], utilModules: 0 },
+      skippedConflicts: result?.workflows?.skippedConflicts ?? [],   // #654 병합 안내
+      replacedBak: result?.workflows?.replacedBak ?? [],             // #673 기준점 없이 교체한 파일 안내
+      legacyLeftover: migrationsResult?.confirmPending ?? [],         // #809 신·구 세대 동시 실행 안내
+      notInstalled: result?.workflows?.notInstalled ?? [],            // #810 깔지 않은 워크플로우 안내
+      semverAutoNewlyOn: sources.semverAutoNewlyOn && context.semverAuto === true, // 업데이트가 켠 사실 안내
+      verification: result?.verification,   // #549 설치 후 검증 결과 (full/workflows 모드에서만 존재)
+      // #569 — 고른 것만 안내하려면 선택값이 필요하다
+      aiPrSummary: context.aiPrSummary, codeReviewCoderabbit: context.codeReviewCoderabbit,
+      logDir: files ? MIGRATION_DIR : null,   // #561 기록 위치 안내
+      logFile: files?.logFile ?? null,
+      traceFile: files?.traceFile ?? null,
+    }, cwd);
+
+    trace.event("run", "end", opts.mode || "", {
+      workflowsCopied: result?.workflows?.copied ?? 0,
+      workflowsSkipped: result?.workflows?.skipped ?? 0,
+    });
+  } catch (err) {
+    // 실패 원인을 로그에 남긴다 (#561) — 서버 로그처럼 사후에 바로 짚을 수 있어야 한다.
+    trace.event("run", "error", opts.mode || "", {
+      message: err?.message || String(err),
+      stack: String(err?.stack || "").split("\n").slice(0, 3).join(" | "),
+    });
+    throw err;
+  } finally {
+    // 어떤 경로로 빠져나가든 기록을 남긴다 (#561) — 조기 return·중간 취소·예외 포함.
+    // 완료 화면 출력이 try 안에 있어야 그 화면까지 미러에 담긴 채로 여기서 닫힌다.
+    if (recordArtifacts) {
+      trace.finalize({ targetRoot: cwd, fromVersion: existing?.templateVersion || "", toVersion: context.templateVersion, now });
+    } else {
+      trace.mirrorStop();
+    }
+    disarmSignals();
+    remove(tempDir);
+  }
+
+  return 0;
+}

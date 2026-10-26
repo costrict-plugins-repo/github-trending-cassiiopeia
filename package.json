@@ -1,0 +1,46 @@
+{
+  "name": "projectops",
+  "version": "4.77.0",
+  "description": "ProjectOps: installer CLI for a fully automated GitHub project management template (versioning, CI/CD, release notes, agent skills)",
+  "keywords": [
+    "devops",
+    "automation",
+    "github-actions",
+    "template",
+    "cli",
+    "pi-package"
+  ],
+  "license": "MIT",
+  "author": {
+    "name": "Cassiiopeia",
+    "url": "https://github.com/Cassiiopeia"
+  },
+  "homepage": "https://github.com/Cassiiopeia/projectops",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Cassiiopeia/projectops.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Cassiiopeia/projectops/issues"
+  },
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  },
+  "bin": {
+    "projectops": "bin/projectops.js"
+  },
+  "engines": {
+    "node": ">=20.12"
+  },
+  "files": [
+    "bin/",
+    "src/"
+  ],
+  "pi": {
+    "skills": [
+      "./skills"
+    ]
+  },
+  "dependencies": {}
+}

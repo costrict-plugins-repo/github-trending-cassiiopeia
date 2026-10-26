@@ -1,0 +1,25 @@
+{
+  "name": "projectops",
+  "description": "Agent skills that drive the projectops automation cycle: issues, worktrees, commits in your own style, reports, reviews, QA and release PRs (15 skills)",
+  "version": "4.77.0",
+  "author": {
+    "name": "Cassiiopeia",
+    "url": "https://github.com/Cassiiopeia"
+  },
+  "homepage": "https://github.com/Cassiiopeia/projectops",
+  "repository": "https://github.com/Cassiiopeia/projectops",
+  "license": "MIT",
+  "keywords": [
+    "devops",
+    "automation",
+    "skills",
+    "code-review",
+    "testing",
+    "documentation",
+    "refactoring",
+    "troubleshooting",
+    "flutter",
+    "spring",
+    "react"
+  ]
+}

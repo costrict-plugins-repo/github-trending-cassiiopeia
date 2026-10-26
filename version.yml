@@ -1,0 +1,50 @@
+# ===================================================================
+# 프로젝트 버전 관리 파일
+# ===================================================================
+#
+# 버전 형식: x.y.z (major.minor.patch)
+#
+# [자동] version_code: 빌드마다 자동 1씩 증가
+#
+# [자동] 버전 승격 폭은 metadata.template.options.semver_auto 로 정해집니다 (#546)
+#       semver_auto: true  → 릴리스 구간 커밋 제목으로 판정
+#                            `제목 : feat! : 내용` 또는 `feat!:` → major
+#                            `제목 : feat : 내용`  또는 `feat:`  → minor
+#                            그 외(fix/docs/chore/refactor/test/자유형식) → patch
+#       키 없음 / false     → 항상 patch +1 (기존 동작)
+#
+# [수동] 위 판정과 무관하게 언제든 이 파일의 version을 직접 수정할 수 있습니다
+#       → 예: 1.0.5 → 1.1.0 또는 2.0.0 으로 올리고 싶으면 직접 수정
+#
+# 지원 타입: spring, flutter, react, react-native,
+#           react-native-expo, node, python, basic
+#           (next는 v4.1.0에서 react로 흡수됨)
+#
+# [멀티타입] 한 레포에 여러 타입 공존 시 project_types 배열에 나열:
+#           project_types: ["spring", "react", "python"]
+#           → 첫 항목이 primary 타입 (버전 파일 결정 기준)
+#           → 단수 project_type 키는 v4.1.0에서 제거됨 — 사용하지 마세요
+#
+# 타입별 동기화 파일:
+# - spring: build.gradle
+# - flutter: pubspec.yaml
+# - react/node: package.json
+# - react-native: Info.plist, build.gradle
+# - react-native-expo: app.json
+# - python: pyproject.toml
+# - basic: version.yml만 사용
+# ===================================================================
+
+version: "4.77.0"
+version_code: 564 # app build number
+project_types: ["basic"] # 멀티타입 배열 — 첫 항목이 primary, 직접 편집 가능
+metadata:
+  last_updated: "2026-10-26 06:40:17"
+  last_updated_by: "Cassiiopeia"
+  template:
+    options:
+      # semver 자동 승격(#546) — 릴리스 구간 커밋 제목으로 major/minor/patch를 결정한다.
+      # `type!` 마커 → major, feat → minor, 그 외 → patch. false면 항상 patch(구 동작).
+      semver_auto: true
+      close_on_release: true   # 릴리스 머지 때 완료 라벨 이슈를 닫는다 (#771)
+      language: en   # 이 저장소의 이슈/PR 템플릿과 봇 문구 언어 (#769, #787)

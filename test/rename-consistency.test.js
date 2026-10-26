@@ -1,0 +1,154 @@
+// #459 네임스페이스 중립화 정합성 회귀 테스트.
+// suh-* 스킬명·cassiiopeia 플러그인명 잔재를 막고, 외부 실체(보존 대상)는 살아있는지 지킨다.
+//
+// OS 독립: git grep 대신 `git ls-files`(추적 파일 목록)만 셸로 얻고, 내용 검사는 Node fs로 한다.
+// (git grep의 pathspec magic·`:` 특수문자·셸 인용이 Windows CI에서 다르게 동작해 오탐하던 문제 수정.)
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { execSync } from "node:child_process";
+import { readdirSync, statSync, existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+
+const ROOT = process.cwd();
+
+// 추적 파일 목록 (node_modules·.git 자동 제외). 경로 구분자는 git이 항상 '/'로 준다(Windows 포함).
+const TRACKED = execSync("git ls-files", { cwd: ROOT, encoding: "utf-8" })
+  .split("\n").map((s) => s.trim()).filter(Boolean);
+
+// 히스토리(과거 산출물·스펙)·CHANGELOG·breaking-changes(구→신 설명)는 잔재 검사에서 제외한다.
+// 이 테스트 파일 자신도 검색어 문자열(cassiiopeia:suh- 등)을 리터럴로 포함하므로 제외한다.
+const EXCLUDE_PREFIX = ["docs/superpowers/", "docs/projectops/"];
+const EXCLUDE_EXACT = [
+  "CHANGELOG.md", "CHANGELOG.json", ".github/config/breaking-changes.json",
+  "test/rename-consistency.test.js",
+  // 레거시 자동 마이그레이션 로직 — 구 플러그인/config 이름(cassiiopeia)을 감지·정리하려면
+  // 그 문자열을 반드시 리터럴로 참조해야 한다(#459 방침: 감지·마이그레이션 로직은 구 이름 보존).
+  "src/core/ide/legacy.js",
+  "src/core/ide/adapters/claude.js",
+  "src/core/ide/adapters/cursor.js",
+];
+
+function isExcluded(path) {
+  if (EXCLUDE_EXACT.includes(path)) return true;
+  return EXCLUDE_PREFIX.some((p) => path.startsWith(p));
+}
+
+// path가 주어진 매처(확장자/접두 경로) 중 하나에 해당하는지.
+function matchScope(path, scopes) {
+  return scopes.some((s) => {
+    if (s.startsWith("ext:")) return path.endsWith(s.slice(4));
+    if (s.endsWith("/")) return path.startsWith(s);   // 디렉토리 접두
+    return path === s;                                 // 정확 파일
+  });
+}
+
+// scopes 범위의 추적 파일에서 substring을 포함한 파일 경로 목록을 반환 (제외 목록 적용).
+// allow: 검사 전에 걷어낼 정식 리터럴(예: GitHub Pages 도메인은 소문자 표기가 정식이다).
+function findFiles(substring, scopes, allow = []) {
+  const hits = [];
+  for (const path of TRACKED) {
+    if (isExcluded(path)) continue;
+    if (!matchScope(path, scopes)) continue;
+    let content;
+    try { content = readFileSync(join(ROOT, path), "utf-8"); }
+    catch { continue; } // 바이너리·읽기 실패는 건너뜀
+    for (const a of allow) content = content.split(a).join("");
+    if (content.includes(substring)) hits.push(path);
+  }
+  return hits;
+}
+
+const DOC_CODE = ["ext:.md", "ext:.js", "ext:.py"]; // 활성 문서·코드
+
+test("skills/ 아래 suh- 폴더가 0개다", () => {
+  const dirs = readdirSync(join(ROOT, "skills"))
+    .filter((d) => statSync(join(ROOT, "skills", d)).isDirectory() && d.startsWith("suh-"));
+  assert.deepEqual(dirs, [], `잔존 suh- 스킬 폴더: ${dirs.join(", ")}`);
+});
+
+test("핵심 pro- 스킬 폴더가 모두 존재한다", () => {
+  // pro-issue는 #467에서 pro-github로 통합·삭제됨 (25종→24종)
+  // design·design-analyze·refactor·refactor-analyze·test·ppt·document 7종은 superpowers 및
+  // pro-report와 역할이 겹쳐 삭제됨 (24종→17종)
+  // pro-spring-test는 #582에서 삭제됨 — assertion 없는 테스트를 만들어 내는 템플릿이었다 (17종→16종)
+  // pro-figma는 #619에서 pro-figma-verify로 통합·삭제됨 — 옮기는 일과 세는 일이 나뉘어 있어
+  // 옮기는 쪽이 무엇을 옮겨야 하는지 모른 채 그림만 보고 만들었다.
+  // #854에서 합쳐진 스킬의 이름을 다시 pro-figma로 바꿨다 (옮기기·대조 한 묶음은 그대로).
+  // 설치본의 옛 pro-figma-verify는 Cursor 어댑터가 "소스에 없는 pro-*"로 보고 지운다.
+  // pro-analyze·pro-plan·pro-implement는 #849에서 삭제됨 — superpowers(brainstorming·writing-plans·executing-plans)와 역할이 겹쳤다
+  // pro-note·pro-build는 #853에서 삭제됨 — 쌓인 기록이 0건이었고, 빌드 명령은 agent가 마커 파일로 직접 정한다
+  // extras의 pro-architecture-consult는 #912에서 pro-code-consult로 이름이 바뀜 — 옛 설정 키·설치 표식은 폴백으로 읽는다
+  //
+  // 이 목록은 "있어야 하는 것"만 담는다. 새 스킬이 늘어도 이 테스트는 건드리지 않아도 되지만,
+  // **스킬을 지울 때는 여기서도 빼야 한다** — 실제로 #582가 이걸 빠뜨려 develop이 깨진 채 있었다.
+  const expected = [
+    "pro-changelog-deploy", "pro-commit",
+    "pro-figma", "pro-github", "pro-init-worktree",
+    "pro-report", "pro-review", "pro-skill-creator",
+    "pro-ssh", "pro-testcase",
+  ];
+  for (const s of expected) {
+    assert.ok(existsSync(join(ROOT, "skills", s, "SKILL.md")), `누락: skills/${s}/SKILL.md`);
+  }
+});
+
+test("활성 문서/코드에 cassiiopeia:suh- 커맨드 표기 잔재가 없다", () => {
+  const hits = findFiles("cassiiopeia:suh-", DOC_CODE);
+  assert.deepEqual(hits, [], `cassiiopeia:suh- 잔재:\n${hits.join("\n")}`);
+});
+
+test("소문자 플러그인명 cassiiopeia 잔재가 없다(대문자 조직명은 허용)", () => {
+  // 매니페스트·IDE 어댑터·활성 문서 대상. 대문자 Cassiiopeia(조직명)는 대소문자 구분으로 통과.
+  // 단, 문서 사이트 도메인(cassiiopeia.github.io)은 GitHub Pages 의 정식 소문자 호스트라 허용한다.
+  const hits = findFiles("cassiiopeia", [
+    ".claude-plugin/", ".codex-plugin/", ".agents/", ".cursor/",
+    "gemini-extension.json", "src/", "ext:.md",
+  ], ["cassiiopeia.github.io"]);
+  assert.deepEqual(hits, [], `소문자 cassiiopeia 잔재:\n${hits.join("\n")}`);
+});
+
+test("@suh-lab 트리거 잔재가 없다(외부 봇 서명 Guide by SUH-LAB은 별개)", () => {
+  const hits = findFiles("@suh-lab", ["ext:.md", ".github/"]);
+  assert.deepEqual(hits, [], `@suh-lab 잔재:\n${hits.join("\n")}`);
+});
+
+// ── 보존 대상(치환 금지)이 살아있는지 — 과잉 치환 회귀 방지 ──
+
+// suh-logger 보존 검사는 대상이던 pro-spring-test가 #582에서 삭제되며 함께 내렸다.
+// 과잉 치환 회귀 방지라는 목적은 아래 'Guide by SUH-LAB' 검사가 이어받는다.
+
+test("보존: 외부 봇 서명 'Guide by SUH-LAB' 매칭이 살아있다", () => {
+  const hits = findFiles("Guide by SUH-LAB", [".github/"]);
+  assert.ok(hits.length > 0, "'Guide by SUH-LAB' 서명 매칭이 사라짐(빌드 트리거 파손)");
+});
+
+test("스킬 개수·목록이 폴더 ↔ 매니페스트 ↔ README·CLAUDE.md 에서 같다", () => {
+  // 실제 폴더 (SKILL.md 있는 것만)
+  const listSkills = (dir, prefix) => readdirSync(join(ROOT, dir))
+    .filter((d) => d.startsWith(prefix) && existsSync(join(ROOT, dir, d, "SKILL.md"))).sort();
+  const core = listSkills("skills", "pro-");
+  const extras = listSkills("plugins/projectops-extras/skills", "pro-");
+  const read = (path) => readFileSync(join(ROOT, path), "utf-8");
+  const expectIn = (path, needles) => {
+    const text = read(path);
+    const missing = needles.filter((n) => !text.includes(n));
+    assert.deepEqual(missing, [], `${path} 에 없음`);
+  };
+
+  // 매니페스트 설명의 개수
+  const market = JSON.parse(read(".claude-plugin/marketplace.json")).plugins;
+  const descriptionOf = (name) => market.find((p) => p.name === name).description;
+  assert.ok(descriptionOf("projectops").includes(`(${core.length} skills)`), "marketplace projectops 개수");
+  assert.ok(descriptionOf("projectops-extras").includes(`(${extras.length} skills)`), "marketplace extras 개수");
+  for (const manifest of [".claude-plugin/plugin.json", ".codex-plugin/plugin.json"]) {
+    assert.ok(JSON.parse(read(manifest)).description.includes(`(${core.length} skills)`), `${manifest} 개수`);
+  }
+
+  // 문서의 개수 표기와 목록
+  expectIn("README.md", [`**Agent Skills** (${core.length})`, `See all ${core.length} Agent Skills`,
+    ...[...core, ...extras].map((s) => `\`/${s}\``)]);
+  expectIn("CLAUDE.md", [`코어 ${core.length}종 + extras ${extras.length}종`,
+    ...[...core, ...extras].map((s) => `| \`${s.slice("pro-".length)}\` |`)]);
+  expectIn("docs/SKILLS.md", [`Skill 전체 목록 (${core.length}종)`, ...core.map((s) => `### \`/${s}\``)]);
+  expectIn("plugins/projectops-extras/README.md", extras.map((s) => `| \`${s}\` |`));
+});

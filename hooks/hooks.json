@@ -1,0 +1,28 @@
+{
+  "description": "projectops: pro-launch devices: release borrowed devices and close browsers when a session ends (#953, #956), and block raw device create/delete commands (#954)",
+  "hooks": {
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/pro_launch_session_end.py\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/pro_launch_raw_device_guard.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
