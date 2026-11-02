@@ -1,0 +1,117 @@
+// full 모드 오케스트레이터.
+// 복사 순서: version.yml → readme → workflows → (deploy블록) → scripts → config →
+//            util(타입별) → issue → discussion → coderabbit → gitignore → setup_guide → (옵션저장)
+import { join } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { writeText } from "../core/fsutil.js";
+import { PATHS } from "../core/paths.js";
+import { installAgentGuide } from "../core/agent-guide.js";
+import { buildVersionYml, mergeDeployValues, resolveUpdatedBy, customYml } from "../core/version-yml.js";
+import { markerForType } from "../core/detect.js";
+import { addVersionSectionToReadme } from "../core/copy/readme.js";
+import { copyWorkflows } from "../core/copy/workflows.js";
+import {
+  copyScripts, copyConfigFolder, copyIssueTemplates, stripIssueTemplateAssignees,
+  copyDiscussionTemplates, copySetupGuide,
+} from "../core/copy/simple.js";
+import { copyUtilModules } from "../core/copy/util.js";
+import { copyCoderabbit } from "../core/copy/coderabbit.js";
+import { ensureGitignore } from "../core/copy/gitignore.js";
+import { applyLabelStyle } from "../core/label-style.js";
+import { applyRepoLanguage } from "../core/repo-language.js";
+import { t } from "../i18n/index.js";
+import { verifyInstall } from "../core/verify.js";
+import { toTemplateOptions } from "../core/resolve-options.js";
+
+// context: { version, types, paths:Map, branch, versionCode, deployTarget, publishTargets, includeSecretBackup,
+//            force, repoName, resolvers, now, today }
+// tempDir: 획득된 템플릿. targetRoot: 통합 대상.
+export function runFull(context, tempDir, targetRoot = ".", hooks = {}) {
+  // 옵션 값은 resolveOptions 가 정해 context 에 넣는다 — 여기서 기본값을 다시 고르지 않는다
+  const { version, types = [], paths = new Map(), branch = "main", versionCode = 1,
+    force = true, now, today, templateVersion, deployBranch = "",
+    deployTarget, publishTargets, codeReviewCoderabbit, labelStyle, language } = context;
+
+  // project_paths 마커 계산 (대표 마커명)
+  const pathMarkers = new Map();
+  for (const [t] of paths) pathMarkers.set(t, markerForType(t));
+
+  // 3. 워크플로우 복사 (+ env 치환) — deploy 블록에 쓸 ask 값을 수집한다.
+  //    hooks.decisions: 대화형 충돌 3지선 결정 Map (미지정=skip — 현행 force 동작)
+  const step = (name, fn, d) => (hooks.trace ? hooks.trace.step(name, fn, d) : fn());
+  const wfCounters = step("copy-workflows", () => copyWorkflows(context, tempDir, targetRoot, hooks),
+    { types, deploy: deployTarget, publish: publishTargets });
+  // 기존 version.yml 의 deploy 값은 보존한다 (#670) — 전체 재생성이라 읽지 않으면 사용자 수정이 사라진다.
+  const vyFile = join(targetRoot, PATHS.versionFile);
+  const deployValues = mergeDeployValues(existsSync(vyFile) ? readFileSync(vyFile, "utf8") : "",
+    wfCounters.deployValues || new Map()); // Map<type, Map<key,value>
+
+  // 1. version.yml 생성 (전체 재생성 — metadata → deploy → template 순)
+  step("write-version-yml", () => writeText(join(targetRoot, PATHS.versionFile),
+    buildVersionYml({
+      version, types, paths, pathMarkers, branch, deployBranch, versionCode, now, today,
+      deployValues,
+      // 생성기가 모르는 키(issue_helper 등)를 지킨다 — version.yml 을 매번 다시 쓰므로 안 그러면 업데이트마다 사라진다 (#835)
+      ...customYml(vyFile),
+      updatedBy: resolveUpdatedBy(existsSync(vyFile) ? readFileSync(vyFile, "utf8") : "", targetRoot), // #811
+      templateOptions: toTemplateOptions(context, { mode: "full", optionsDate: today }),
+    })), { version, versionCode });
+
+  // 2. README 버전 섹션
+  step("update-readme", () => addVersionSectionToReadme(version, targetRoot, language), { version });
+
+  // 5. scripts / config
+  //    워크플로우 밖 영역도 기록한다 (#561) — "내 스크립트가 갱신됐나"를 로그만 보고 알 수 있게.
+  step("copy-scripts", () => copyScripts(tempDir, targetRoot));
+  step("copy-config", () => copyConfigFolder(tempDir, targetRoot));
+
+  // 6. util (타입별)
+  for (const t of types) step("copy-util", () => copyUtilModules(tempDir, t, { force }, targetRoot), { type: t });
+
+  // 7. issue / discussion 템플릿
+  step("copy-templates", () => {
+    copyIssueTemplates(tempDir, targetRoot);
+    // Discussion 템플릿도 오버레이 대상 (#988) — 오버레이보다 먼저 복사해야 한국어판이 덮인다
+    copyDiscussionTemplates(tempDir, targetRoot);
+    // 템플릿 언어(#769) — 원본은 영문이라 한국어 레포는 복사 직후 오버레이로 덮는다.
+    // 라벨 표기 변환(apply-label-style)보다 반드시 먼저여야 한다.
+    const { changed: overlaid, failed: overlayFailed } = applyRepoLanguage(tempDir, targetRoot, language);
+    hooks.trace?.event("copy", "repo-language", language, { overlaid: overlaid.length, failed: overlayFailed.length });
+    for (const f of overlayFailed) hooks.trace?.event("copy", "overlay-failed", f.file, { reason: f.error });
+    // 담당자 고정값 제거(#782) — 오버레이가 다시 넣으므로 그 뒤에 한다.
+    hooks.trace?.event("copy", "strip-assignees", "", { files: stripIssueTemplateAssignees(targetRoot).length });
+    if (overlayFailed.length) console.error(t("language.overlayFailed", { n: overlayFailed.length, files: overlayFailed.map((f) => f.file).join(", ") }));
+  });
+
+  // 8. coderabbit / gitignore / setup guide
+  //    CodeRabbit 코드리뷰 미사용 선택(#457)이면 .coderabbit.yaml을 복사하지 않는다.
+  step("copy-coderabbit", () => copyCoderabbit(tempDir, { force, enabled: codeReviewCoderabbit }, targetRoot),
+    { enabled: codeReviewCoderabbit });
+  step("ensure-gitignore", () => ensureGitignore(targetRoot));
+  step("copy-setup-guide", () => copySetupGuide(tempDir, targetRoot));
+  step("install-agent-guide", () => installAgentGuide(targetRoot, templateVersion)); // agent 가 옵션을 확인하는 법 안내
+
+  // 상태 라벨 표기(#776) — 템플릿 원본은 영문이라, 한글 레포는 복사가 끝난 뒤 이름만 되돌린다.
+  step("apply-label-style", () => applyLabelStyle(targetRoot, labelStyle), { labelStyle });
+
+  // 9. 설치 후 검증 (#549) — 디스크에 쓰인 최종 결과물을 다시 읽는다.
+  //    치환은 파일 단위로 흩어져 일어나고 auto 토큰은 resolver 결과에 의존하므로,
+  //    최종 내용을 보는 것이 실제 배포될 것과 같은 것을 보는 유일한 방법이다.
+  const verification = step("verify-install", () => verifyInstall(targetRoot));
+  // detail 키 이름 주의: run-trace의 민감값 가드가 pat|token|secret|password|credential을
+  // 키에서 걸러낸다(#494). 여기서 다루는 값은 비밀이 아니라 "치환 플레이스홀더 이름"과
+  // "등록이 필요한 키 이름"이라 가드에 걸리지 않는 이름을 쓴다 — 가드 자체는 우회하지 않는다.
+  hooks.trace?.event("verify", "scan", "", {
+    unresolved: verification.unresolved.length,
+    requiredKeys: verification.secrets.size,
+  });
+  // 미치환 값은 배포 시점에 실패할 자리다 — 어느 파일 몇 번째 줄인지 로그에 남긴다.
+  for (const u of verification.unresolved) {
+    hooks.trace?.event("verify", "unresolved", u.filename, { line: u.line, placeholder: u.token });
+  }
+  for (const [name, users] of verification.secrets) {
+    hooks.trace?.event("verify", "required-key", name, { workflows: users });
+  }
+
+  return { workflows: wfCounters, verification };
+}

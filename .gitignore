@@ -1,0 +1,33 @@
+/.idea
+/.claude/settings.local.json
+
+# macOS Finder metadata
+.DS_Store
+
+# Node.js (projectops CLI 개발용 — 배포는 npm이 의존성 자동 설치)
+node_modules/
+*.tgz
+package-lock.json
+# 문서 사이트(site/)는 CI 에서 npm ci 로 설치하므로 락 파일을 추적한다 (#755)
+!site/package-lock.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.suh-template/config/issue.config.json
+
+# Cursor 플러그인 로컬 메타 파일
+.cursor/skills/cursor-skills-meta.json
+.template_download_temp/
+
+# Windows NUL 디바이스 파일
+nul
+
+# CodeGraph 로컬 인덱스 (SQLite 지식 그래프)
+.codegraph/
+
+# Agent work records (issues, reports, plans, specs). Kept locally, not published (#770)
+docs/projectops/
+docs/superpowers/
