@@ -1,0 +1,168 @@
+# Architecture
+
+This document explains how projectops is put together and where to make a change.
+For setup and usage see the [README](README.md); for contribution rules see [CONTRIBUTING](CONTRIBUTING.md).
+
+## Two identities
+
+This repository is two things at once, and most mistakes come from forgetting that.
+
+1. **A GitHub template repository.** "Use this template" copies it, then `PROJECT-TEMPLATE-INITIALIZER` runs `.github/scripts/template_initializer.py` and deletes everything that only makes sense here.
+2. **The source of the `npx projectops` wizard.** The wizard downloads this repo and copies the shared parts into an existing project, skipping the same repo-only files.
+
+Anything you add at the repository root has to answer one question: *does a user's project need this?*
+
+## Execution flow of `npx projectops`
+
+```
+bin/projectops.js
+  └─ src/index.js            parse args, resolve language, route to a mode
+       ├─ core/assets.js     acquire the template (git clone, or a local path in tests)
+       ├─ core/detect*.js    detect project types, version, default branch
+       ├─ core/breaking-check.js, core/migrations/   warn about breaking changes, neutralise renamed workflows
+       ├─ commands/*.js      full | workflows | version | issues | skills | interactive | doctor
+       │    └─ core/copy/*   the copy engine (workflows, scripts, config, util modules, issue templates, ...)
+       ├─ core/verify.js     check the result
+       └─ core/run-trace.js  write the execution record under .github/.projectops/logs/
+```
+
+- **Non-interactive first.** `--force` / `-y` is the primary path; the interactive wizard collects the same options and calls the same engine.
+- **Language** is resolved in `src/i18n/` (`--lang` > `PROJECTOPS_LANG` > system locale > `en`; CI and `--force` are pinned to `en`). Logs are always English.
+- **The copy order** is fixed in `src/commands/full.js`: `version.yml` → README section → workflows → scripts → config → util modules → issue templates → coderabbit → `.gitignore`.
+- **`version.yml`** is the single source of truth for what was installed (`metadata.template.options.*`). Reinstalling reads it back instead of asking again.
+
+## Repository layout
+
+| Path | What it is | Ships to user projects |
+|---|---|---|
+| `src/`, `bin/`, `test/` | The npx wizard and its tests | No |
+| `.github/workflows/` | Workflows. `PROJECT-COMMON-*` are the shared set; `PROJECT-TEMPLATE-*` run only here | Common only |
+| `.github/workflows/project-types/<type>/` | Per-type workflows (`flutter`, `spring`, `react`, `node`, `python`, `common`) | By selection |
+| `.github/scripts/` | Python/shell helpers the workflows call (`version_manager`, `changelog_manager`, `issue_helper`, ...) | Yes |
+| `.github/util/` | Wizards for store deployment and Projects sync | By selection |
+| `skills/` | Agent skills (Claude Code plugin, Cursor install source) | No (installed separately) |
+| `docs/` | Documentation | No |
+| `version.yml` | Version and install options | Regenerated per project |
+
+## Invariant contracts
+
+These are parsed by other code. Changing them silently breaks installed projects.
+
+- **Branch name** `YYYYMMDD_#<issue>_<title>` and the `### Branch` code block in the issue helper comment. Consumers are listed in [`docs/BRANCH-CONVENTION.md`](docs/BRANCH-CONVENTION.md).
+- **The README version section** title, which `PROJECT-COMMON-README-VERSION-UPDATE` searches for.
+- **Workflow file names.** Renaming or deleting one requires an entry in `src/core/migrations/registry.js`, or existing installs keep running the old file.
+- **Common workflows exist twice**: the original in `project-types/common/` and the copy in `.github/workflows/` root. Keep them identical.
+
+## How to add a new project type
+
+Type facts live in one file, **`src/core/project-types.json`** (#1244). The installer reads it directly; the Python
+scripts in user repos and the skills read generated copies. Open an issue first and agree on the markers, the version
+file and the build commands. Example: adding `go`.
+
+1. **Add an entry** to `src/core/project-types.json`. Array position is the detection order and decides the primary type
+   when several types are found. Fields:
+   - `detect`: `markers` (files that mean this type), optional `package_json` rule (dependency keys:
+     `requires_all`, `requires_any`, `requires_any_prefix`, `excludes_any`, `excludes_any_prefix`), optional
+     `fallback_only`, optional `extensions` (`patterns`, `min_count`) for the no-marker recommendation, and `secondary`
+     (text for the detection doc)
+   - `path_search`: `files` that locate the project folder in a monorepo (first = main marker), optional `require_dir`,
+     `exclude_parts`, `gradle_settings_root`
+   - `version`: `format` (a handler in `.github/scripts/version_manager.py`, or null for version.yml only),
+     `build_number` (handler or null), `display`, `comment` (language-neutral), `example`
+   - `axes`: deploy and publish targets (empty for app types), `is_app`, `launch_kinds` (`app`, `web`, `server`),
+     `root_resolver` (`<name>-root` when workflows use `APP_ROOT: "."  # @wizard auto:<name>-root`, else null),
+     `deploy_trigger_workflows` (workflow files that deploy on push)
+   Unknown fields fail the check, so a typo cannot silently do nothing.
+2. **Create `.github/workflows/project-types/<id>/`** with its workflows. Server deployment goes under
+   `<id>/server-deploy/`, registry publishing under `<id>/publish/<target>/`. Read `docs/architecture/agent/workflows.md`
+   first (permissions, `@wizard` markers, `paths-anchor` for monorepos). A type without workflows has no folder.
+3. **Only if the version file has a new format**, add a handler to `VERSION_FORMAT_HANDLERS` (and
+   `BUILD_NUMBER_HANDLERS` if it has a build number) in `.github/scripts/version_manager.py`. Go has no version file:
+   `"format": null`.
+4. **Run `node scripts/build_project_types.mjs`.** It writes the copies (`.github/config/project-types.json`,
+   `scripts/common/project_types.json`) and the generated blocks in the READMEs, `CLAUDE.md`, the version-control docs
+   and `skills/references/project-detection.md`.
+5. **Optional, by hand:** per-type lines on the finish screen (`src/ui/summary.js` + both `src/i18n/summary.*.js`), shared
+   script logic in `.github/scripts/` added to `copyScripts` (`src/core/copy/simple.js`), branch-name guide lines in
+   `issue_helper.py` (`GUIDE_LINES`), CI minutes rewrites (`src/core/ci-minutes-sub.js`), a docs page in both languages.
+6. **Verify:** `npm test` (registry check and generated blocks), then install into a sample repo from the working tree
+   (copy the tree into `.template_download_temp/` of the sample, then `node <repo>/bin/projectops.js --mode full --force`),
+   with and without `--type`, also as a monorepo subfolder. Do not commit new tests.
+
+## How to add a CLI flag
+
+1. Parse it in `src/cli/args.js` (`parseArgs`) and validate the value there. Value lists that other files also need (deploy, publish, intent, label style, providers) live in `src/core/constants.js` — add to that list, not to a local array.
+2. Describe it in **`src/core/options-schema.js`** (`FLAGS`). `npx projectops --mode options --json` prints this table for AI agents, and `test/options-schema.test.js` fails if a flag exists in `args.js` but not here.
+3. Add it to `--help` in `src/cli/help.js` (English and Korean) and to the option tables in `docs/CLI.md` and `docs/en/cli.md`.
+4. Resolve the value in **`src/core/resolve-options.js`** (`resolveOptions`: flag > stored value > default) and pass the flag in from `src/index.js`. Both paths use that result — `src/index.js` as is, `src/commands/interactive.js` as the starting answer — so do not write a default anywhere else.
+
+## How to add a `version.yml` option
+
+1. Read it in `parseTemplateOptions` and write it in `buildVersionYml` (`src/core/version-yml.js`). `version.yml` is regenerated on every update, so a key that is only read, never written back, disappears on the next update. Add the comment text to both languages in `COMMENTS`.
+   If it is a key under `metadata.template.options`, add it to `OWNED_OPTION_KEYS` in the same file, or every update writes it twice (once by the generator, once kept as an unknown key).
+2. Add it to `VERSION_YML` in `src/core/options-schema.js` with its default.
+3. Decide its value in `resolveOptions` (`src/core/resolve-options.js`) and add its name to `TEMPLATE_OPTION_FIELDS` there. `full.js` and `version.js` write exactly those fields through `toTemplateOptions`, so they need no change. Declare it in `src/context.js` with `null`; `src/index.js` spreads the resolved values into the context, while `src/commands/interactive.js` lists each value when it builds the context, so add it there.
+4. If a workflow reads it, say what a **missing** key means and make the workflow and the wizard agree (`semver_auto` shipped with them disagreeing).
+
+## How to add a release-note provider
+
+1. Implement it in `.github/scripts/changelog_providers/` and register it in `ladder.py` and `openai_compatible.py` (`PRESETS`) if it speaks the OpenAI API. Never put a version in the model name; use a `-latest` alias.
+2. Add the name to `CHANGELOG_PROVIDERS` in `src/core/constants.js`.
+3. Add the secret name to the AI key lists (`ladder.py`, `src/commands/doctor.js`, `src/ui/summary.js`, the workflow `env:` blocks). Nothing checks this automatically, so compare them by hand.
+4. List the new file in `src/core/copy/simple.js`, or user repos will not get it.
+
+## How to add a language
+
+See [`docs/TRANSLATING.md`](docs/TRANSLATING.md). Three places hold the language list and must agree: `REPO_LANGUAGES` (`src/core/repo-language.js`), `SUPPORTED_LANGS` for the CLI screen (`src/i18n/index.js`), and the message catalog `.github/scripts/i18n/<code>.json`. The `version.yml` parser builds its pattern from `REPO_LANGUAGES`, so a new language is read back correctly.
+
+## How to add a skill
+
+Use the `pro-skill-creator` skill to write the skill itself. Then register it everywhere below. This list comes from the commits that added `pro-image` and `pro-presentation`; the guard checks catch most misses, but only after they fail.
+
+| # | File | What to change | Caught by |
+|---|---|---|---|
+| 1 | `skills/pro-<name>/SKILL.md` (+ `references/`, `scripts/`) | The skill. Description in English, 300 characters or fewer, saying what it does and when to use it | `scripts/tests/test_skill_docs.py` |
+| 2 | `scripts/projectops_cli.py` | Add the skill to `SKILL_CLIS` **and** raise `RESOLVER_REVISION` by 1. Without the raise, installed entry points keep refusing the new skill with `bad_args` (#1080) | — |
+| 3 | `AGENTS.md` | One row in the skills routing table | `test/options-schema.test.js` |
+| 4 | `CLAUDE.md` | One row in the skills table and, if users ask for it in words, one row in "Skill routing" | `test/rename-consistency.test.js` |
+| 5 | `README.md` + `docs/i18n/README.{ko,ja,zh-CN}.md` | One row in the skills table of each, and the skill count wherever it appears | `test/rename-consistency.test.js` |
+| 6 | `docs/SKILLS.md` + `docs/en/skills.md`, `docs/README.md` + `docs/en/readme.md` | A `### /pro-<name>` section in both skill guides, and the skill count in both docs READMEs | `test/rename-consistency.test.js` (`docs/SKILLS.md` sections and the counts) |
+| 7 | `.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json`, `.codex-plugin/plugin.json` | The skill count in the description | `test/rename-consistency.test.js` |
+| 8 | `scripts/common/paths.py` `DOCUMENT_SKILLS` | Only if the skill saves documents under the output folder | — |
+| 9 | `skills/config.json.example` + `skills/references/config-rules.md` | Only if the skill has settings. A secret goes in the credential store and the section holds only its name (`config-rules.md` §9, `scripts/common/credentials.py`) | — |
+| 10 | `scripts/tests/korean_line_budget.json` | Only to lower counts. English skill text must not add Korean lines | `scripts/tests/test_korean_line_budget.py` |
+
+New files are counted by the guard checks only once git tracks them: run `git add -N <new files>` before `npm test` and `python3 -m pytest scripts/tests/`.
+
+## How to add a new workflow
+
+1. Shared by every project → put it in `project-types/common/` **and** copy it to `.github/workflows/`. Type specific → only `project-types/<type>/`.
+2. Include `workflow_dispatch`, a `concurrency` group, `[skip ci]` on bot commits, and an explicit `permissions:` block (`.github/scripts/test/test_workflow_permissions.py` enforces it).
+3. If the workflow depends on the branch naming rule, add it to `GUIDE_LINES` in `.github/scripts/issue_helper.py`.
+4. If it is conditional (an opt-in folder under `common/`), update **both** the copy gate in `src/core/copy/workflows.js` and `commonOptionalOrphans` in `src/core/orphan-workflows.js`, otherwise turning it off leaves the file behind.
+5. If you rename or remove one, register the old name in `src/core/migrations/registry.js`.
+
+## How to add a file that must not reach user projects
+
+Update both places, or new projects get polluted or the wizard copies it:
+
+| File | Effect |
+|---|---|
+| `.github/scripts/template_initializer.py` | Deleted when a repo is created from the template |
+| `src/core/exclusions.js` | Skipped when the wizard copies into an existing project |
+
+If it carries a version that must match `version.yml`, also add a step to `PROJECT-TEMPLATE-PLUGIN-VERSION-SYNC`.
+
+## Testing
+
+```bash
+npm test                                                   # guard checks (skill list, options schema)
+python3 -m pytest scripts/tests/ .github/scripts/test/ -q  # guard checks (skill docs, Korean line budget, workflow permissions)
+```
+
+Do not commit new tests: this repository keeps only five guard tests (see `CLAUDE.md`). Check your change by running it, or with a throwaway test you delete afterwards.
+CI runs these guards on every push and a CLI smoke run on three OSes on `main`: this repo has broken on macOS bash 3.2 and Windows before.
+
+## Known duplication
+
+The common workflows existing in two places is a consequence of the copy structure, not a design goal. Whether to generate one from the other is tracked as a follow-up to [#773](https://github.com/Cassiiopeia/projectops/issues/773).

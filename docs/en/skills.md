@@ -1,0 +1,668 @@
+# Agent Skills guide
+
+> **This repository is an Agent Skill package you can use with Claude Code, Cursor, Gemini CLI, and Codex CLI.**
+> Along with the GitHub Actions automation template, it provides 18 development/DevOps Skills.
+
+---
+
+## What is a Skill?
+
+A Skill is an **expert mode** with instructions and an output format specialized for one kind of task (for example code review, writing an issue, or refactoring). In Claude Code you call it as `/pro-<skill>` (for example `/pro-review`). Gemini CLI reads this repository's `skills/` through an extension, and Codex CLI reads it through a plugin marketplace.
+
+For example, when you run `/pro-review`, Claude does not just answer "take a look at my code". It reviews from **six angles: security, performance, bugs, quality, architecture, and tests**, and returns the result sorted by **Critical/Major/Minor priority**.
+
+---
+
+## Installation
+
+### Claude Code
+
+```bash
+claude plugin marketplace add Cassiiopeia/projectops
+claude plugin install projectops@projectops-marketplace --scope user
+```
+
+After installing, type `/pro-` in Claude Code and the list of available Skills autocompletes.
+
+### Cursor
+
+With the `skills` mode of `npx projectops`, `skills/` is copied to the Cursor path.
+
+```bash
+# same on macOS / Linux / Windows
+npx projectops --mode skills
+```
+
+In the interactive menu, choose `Agent Skill 설치` (install Agent Skill), then pick the Cursor scope.
+
+### GitHub Copilot
+
+GitHub Copilot (VS Code chat, JetBrains IDEs and the Copilot CLI) reads personal agent skills from `~/.copilot/skills/<name>/SKILL.md`.
+Pick `GitHub Copilot` in `npx projectops --mode skills`: `skills/` is copied to `~/.copilot/skills/`, the shared Python the skill CLIs use (the runtime files of `scripts/`)
+to `~/.copilot/scripts/`, and the stable entry point `~/.projectops/bin/projectops_cli.py` is installed too.
+It shows up as an install target when the copilot CLI, a `~/.copilot` folder, the VS Code Copilot extension or the JetBrains Copilot plugin is present.
+In JetBrains IDEs, turn Skills on under `Settings > GitHub Copilot > Chat > Agent`. `~/.copilot/intellij-skills/` is managed by the plugin and is left alone.
+
+```bash
+npx projectops --mode skills
+```
+
+After installing, type `/pro-` in Copilot chat to see the skills.
+
+### Gemini CLI
+
+Gemini CLI installs it as an extension.
+
+```bash
+gemini extensions install https://github.com/Cassiiopeia/projectops
+```
+
+Update:
+
+```bash
+gemini extensions update projectops
+```
+
+After installing, Gemini reads `GEMINI.md` according to `contextFileName` in the root `gemini-extension.json`, and refers to `skills/{skill-name}/SKILL.md`.
+
+### Codex CLI
+
+Codex registers this repository as a plugin marketplace source. It is not listed in the official OpenAI marketplace; instead, you add a GitHub repo you trust yourself as a marketplace source.
+
+**Method 1 (default):** Register the plugin marketplace
+
+macOS / Linux:
+
+```bash
+codex plugin marketplace add Cassiiopeia/projectops
+```
+
+Wizard install:
+
+```bash
+npx projectops --mode skills
+```
+
+The wizard registers the Codex marketplace. After registering, check the `projectops` entry in `/plugins`.
+
+Update:
+
+```bash
+codex plugin marketplace upgrade projectops
+```
+
+**Method 2 (fallback):** Activate immediately with git clone + symlink
+
+Use this when the marketplace command is not available or you need it right away.
+
+macOS / Linux:
+
+```bash
+git clone https://github.com/Cassiiopeia/projectops.git ~/.codex/projectops
+mkdir -p ~/.agents/skills
+ln -s ~/.codex/projectops/skills ~/.agents/skills/projectops
+```
+
+Windows PowerShell:
+
+```powershell
+git clone https://github.com/Cassiiopeia/projectops.git "$env:USERPROFILE\.codex\projectops"
+New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.agents\skills"
+cmd /c mklink /J "%USERPROFILE%\.agents\skills\projectops" "%USERPROFILE%\.codex\projectops\skills"
+```
+
+In Codex there is no slash command UI. You use Skills by having it read the relevant `SKILL.md` through `AGENTS.md` and the installed `skills/`.
+
+---
+
+## Full Skill list (18)
+
+By purpose, they fall into four groups:
+
+- **Analysis** (1) — Only read code and never modify it. Return plans, reviews, or diagnoses.
+- **Implementation** (9) — Actually modify or create files.
+- **Development cycle automation** (4) — Do commits, deploys, GitHub work, and server checks for you.
+- **Document/artifact generation** (4) — Do not touch code; generate `.md` files or reports.
+
+> Design, planning, and implementation are handled by `superpowers` (brainstorming → writing-plans → executing-plans), not by this plugin.
+
+
+---
+
+## 📊 Analysis Skills (1)
+
+They do not modify code. Use them "when you want to understand the situation first".
+
+### `/pro-review`
+
+**What does it do?**
+It reviews code from **six angles: security, performance, bugs, quality, architecture, and tests**. It sorts the issues it finds into **Critical / Major / Minor**, and also points out what was done well.
+
+**Modifies**: nothing
+**Returns**: review comments by priority + improvement suggestions
+
+**When to use it**
+- Self-review before opening a PR
+- A second look at a specific file or function
+- After finishing an implementation, to check "did I miss anything?"
+
+---
+
+## 🔧 Implementation Skills (9)
+
+They actually modify files. Use them when you want the work to be carried out.
+
+### `/pro-figma`
+
+**What does it do?**
+It **moves a Figma design into code and counts whether what you moved matches the design.** It lists every fill, border, effect, and layout in the dump without omission and uses that as the work list. It converts to responsive units, then compares the design image against the app screen pixel by pixel and points out where they differ.
+
+**Modifies**: the relevant component files
+**Returns**: a classification table + responsive code + pixel comparison results (including a diff image)
+
+**When to use it**
+- When moving a screen handed over by a designer into code
+- When checking whether the moved screen matches the design
+- After a designer says "this is different", to pin down what is different
+
+> Moving and counting are one Skill. If they are split, the person moving works only from the picture without knowing what must be moved — in practice, a build has shipped with three of four effect lines missing.
+
+---
+
+### `/pro-oss-consult`
+
+**What does it do?**
+It **diagnoses a GitHub repo as an open source project**. It first determines the repo's nature (deployable app, small tool, CLI, docs, template, and so on), then scores it strictly on six axes — first impression, proof of value, community, code extensibility, legal safety, and long-term operation — and tells you the maturity stage and the prerequisites for the next stage. Scripts collect the facts; the agent makes the judgments.
+
+**Modifies**: only what you approve — About, topics, Discussions, and labels (through this Skill's CLI), and document files added on a new branch. For each repo it shows a plan and asks for approval, and it does not change visibility, delete, or replace a license; it only suggests those.
+**Returns**: a diagnosis report (scores on six axes, defects, improvements, maturity), and a scoreboard for an account-wide batch check
+
+**When to use it**
+- To check whether your repo is in a state where other people can find it and contribute
+- To check the blockers to going public (committed secrets, license, personal data) on a repo you just opened
+- To sweep all repos of an account or organization at once and set priorities
+
+> Issue, PR, and comment work itself is `/pro-github`, and review of code changes is `/pro-review`.
+
+**Example: on this repo.** We ran `/pro-oss-consult` on this repo, then fixed what it found (measured 2026-10-13).
+
+| Check | Before | After |
+|---|---|---|
+| Skill count stated in README and manifests | inconsistent (15 vs 20 stated, actual 15) | consistent: 14 core + 1 in the optional extras plugin |
+| Longest skill description | 1,183 chars; 6 over 1,000 | 237 chars; 0 over 300 |
+| Commit format | hardcoded in `pro-commit` | configurable via preferences and `version.yml` |
+
+What it changed: descriptions were cut to short English triggers, a guard test now checks every core skill's docs, and `pro-commit` follows your team's `version.yml` commit template.
+
+---
+
+### `/pro-init-worktree`
+
+**What does it do?**
+Give it only a branch name and it **creates a Git worktree automatically**, then analyzes `.gitignore` to find candidate local config files that exist in the original project. The agent decides for each candidate whether copying is needed, selectively copies only the necessary files with the reason, and reports the candidates it did not copy at the end. It also handles UTF-8 encoding problems.
+
+**Modifies**: creates a new worktree directory + selectively copies the needed local config files
+**Returns**: the created worktree path + a report of copied/skipped/missing candidates
+
+**When to use it**
+- When you want to work in a separate worktree for each PR
+- When you do not want to miss files the worktree also needs, such as `.env`, Firebase config, signing keys, and local build settings
+
+---
+
+### `/pro-launch`
+
+**What does it do?**
+A **capability Skill** that starts, operates, and captures apps, web, and servers. It captures Android emulator and iOS simulator screens with the status bar fixed, and opens a browser to navigate, click, type, and capture. By changing the width or swapping API responses, it can stage empty-list, failure, and loading states without touching the server. Single HTTP requests, DB queries, and server logs also run using the connection method you wrote down.
+
+**Modifies**: nothing (only saves captures and run records)
+**Returns**: capture images + run result JSON
+
+**When to use it**
+- "Start the emulator and capture it", "capture it at mobile width"
+- When you need state screens such as an empty list or a 500 error
+- When another Skill (`pro-agent-test`, `pro-ui-design`, `pro-figma`) needs to capture a screen
+
+> QA that goes through the app end to end looking for bugs is `/pro-agent-test`. This Skill is "a tool for starting and capturing".
+
+**Web sign-in** — It signs in to Google, Apple, Naver, Kakao and GitHub in the browser. It first reuses a profile that is already signed in, takes the account from your saved credentials, and hands two-factor, captcha and passkey screens to you. When an Apple sign-in sends its code to the Mac the agent runs on, it can read that code from the system alert, only after you agree. Details: [`web-sign-in.md`](https://github.com/Cassiiopeia/projectops/blob/main/skills/pro-launch/references/web-sign-in.md).
+
+**Hide personal data before posting** — `mask` covers areas of a screenshot with a solid box, and `redact` replaces known secret and personal formats in a log. Both write a new file (`<name>.masked<ext>`, `<name>.redacted<ext>`) and never change the original; attach only the new file. Details: [`evidence.md`](https://github.com/Cassiiopeia/projectops/blob/main/skills/pro-launch/references/evidence.md).
+
+**Harness folders** — A harness is one folder per site or workflow you repeat: a `README.md` guide the agent follows, plus optional helper scripts. It lives on this machine (`~/.projectops/launch/_machine/harness/<name>/`) or for one repo, and comes back automatically when the agent opens a matching URL, host, app or window. Adding a site means adding a folder, not code. Details: [`harness.md`](https://github.com/Cassiiopeia/projectops/blob/main/skills/pro-launch/references/harness.md).
+
+---
+
+### `/pro-desktop-control`
+
+**What does it do?**
+It drives **programs on this computer's screen** that are neither web pages nor emulators. It presses "Next" in installer wizards, answers OS dialogs (file open, permission prompts), and changes settings in desktop apps. It reads the screen's elements to pick one, and presses without moving the mouse where it can. It asks before pressing a button that changes something (an install, agreeing to terms), and hands security prompts such as administrator rights (UAC) to the user. It is a procedure Skill on top of `/pro-launch`'s `desktop` command group. Works on Windows and macOS. On macOS it also answers notifications and system dialogs, such as the Apple Account sign-in alert and its code window, always asking before it approves a sign-in.
+
+**Modifies**: no code. The state of programs on screen (installs, settings) changes only through the buttons the user approved
+**Returns**: the names of the buttons pressed + what is on screen now + anything left for the user (a capture only when the result is visual)
+
+**When to use it**
+- "Press Next in the installer", "finish this setup wizard"
+- "Click OK in that dialog", "change this setting in the app"
+- When a web flow hands off to a downloaded program (a security module installer, a certificate tool)
+
+> Pages inside a browser belong to `/pro-launch`'s `web`, and emulator or simulator screens to `app`. Bug-hunting QA is `/pro-agent-test`.
+
+---
+
+### `/pro-code-consult`
+
+**What does it do?**
+Turns AI-written code into **code a person can maintain for a year**. It audits against your coding conventions (too many comments, stale comments, new code that reuses nothing, reversed layer dependencies, large files and abbreviations), refactors approved items one at a time while comparing before/after runs, checks just a diff, and freezes existing violations in a list (`docs/architecture/rules/`) that can only shrink. Scripts collect facts; the agent judges.
+
+**What it changes**: approved refactoring targets, frozen lists, rule tests (Flutter, Spring, Python, JavaScript)
+**What it returns**: an audit report grouped by cause + a refactoring proposal
+
+**When to use it?**
+- "This code feels like a mess, look over the whole thing"
+- Checking comments, names and duplicates in what you just wrote, before committing
+- Installing your coding conventions and rule tests in a new project
+
+---
+
+### `/pro-image`
+
+**What does it do?**
+It makes image assets that fit your project's own style: backgrounds, characters, icons, illustrations and items. The agent reads the repo's art harness (style, characters, reference images, past approvals) and turns a loose request into a complete prompt; Codex (ChatGPT subscription) or Antigravity draws it, and the CLI fixes the exact size and real transparency. When no style is set yet, it draws the same subject in a few looks on one numbered board so you can pick the one that fits.
+
+**Modifies**: only the approved image in your app folder, and the harness in `docs/image-harness/` (candidates stay outside Git in `~/.projectops/image/`)
+**Returns**: the finished image (requested size, transparent PNG when needed), a comparison board, a generation history
+
+**When to use it**
+- "Make a background for this screen", "draw a few expressions of this character", "make an app icon"
+- "Which art style fits our app?", "show me a few styles"
+
+> Comparing screen layouts is `/pro-ui-design`; moving a Figma design into code is `/pro-figma`.
+
+---
+
+### `/pro-ui-design`
+
+**What does it do?**
+It shows UI mockups on a local URL so you can compare and pick. Mockups use your repo's real tokens and fonts, can be real code renders, and can really move: compare animations with slow motion, or press through a linked prototype where an action on one screen changes another. Then it builds the pick, posts a PNG or GIF to the issue, or hands it to a designer as a design request with per-state captures and copy candidates.
+
+**Modifies**: nothing in Git (mockups live in an ignored folder)
+**Returns**: a local URL, your decision on record, and optionally an issue comment or a design request (issue, HTML or md)
+
+**When to use it**
+- "Show me a few mockups", "compare these animations", "let me press through this flow"
+- "Post the mockup to the issue"
+- "Request a design", "ask them to draw the empty and error screens too"
+
+> Moving an existing Figma design into code and comparing it is `/pro-figma`.
+
+---
+
+### `/pro-presentation`
+
+**What does it do?**
+It builds a talk as an HTML deck and lets you rehearse it out loud, one slide at a time. The agent flags only what trips, using presentation style rules, keeps each spoken take with its feedback, and writes every direction you give into the deck's memory and applies it to all slides. The practice page refreshes as soon as a file changes. Give it a recording link and it splits captions per slide and compares timing with earlier takes. It exports PDF and an editable-text PPT, then checks the PPT against the HTML.
+
+**Modifies**: nothing in Git (the deck folder ignores itself)
+**Returns**: a deck folder, a local practice URL, per-slide timing across takes, PDF and PPT with a verify report
+
+**When to use it**
+- "Let's rehearse my talk", "make the slides", "rehearse with this PPT"
+- "I uploaded a recording, compare it"
+- "Export it to PPT", "give me a PDF"
+
+> Rubric scoring and Q&A drills come from pro-judge when it is installed.
+
+---
+
+## 🔄 Development cycle automation Skills (4)
+
+From registering an issue to committing, deploying, and checking the server — AI takes over the repetitive work.
+
+### `/pro-commit`
+
+**What does it do?**
+It reads the issue context (`.projectops/context/current-issue.json`) saved by the issue creation of `/pro-github` or by `/pro-init-worktree`, **auto-completes a message that fits the project commit convention**, and commits. It always proposes the message first and runs only after the user confirms.
+
+**Modifies**: a git commit (based on staged files)
+**Returns**: a finished commit in the form `issue title : type : change description issue URL`
+
+**Commit convention**:
+```
+issue title : feat : change description https://github.com/.../issues/123
+```
+
+**When there is no issue context**:
+1. Create a new issue (guides you through the `/pro-github` issue creation flow)
+2. Enter an issue number directly (info is looked up from GitHub automatically)
+3. Commit in free form without an issue
+4. Cancel
+
+**Follows superpowers principles**:
+- If nothing is staged, it does not run `git add` for you — the user stages by hand
+- It never runs a commit without user confirmation
+- It never runs `git push` — it handles the commit only
+
+**When to use it**
+- When copying and pasting the issue number/URL into every commit message is a chore
+- When you want to keep the team commit convention consistent
+
+---
+
+### `/pro-changelog-deploy`
+
+**What does it do?**
+It pushes the `develop` branch, creates a release PR (`deploy` PR) to `main`, and **writes the release notes itself** into the PR body. When the `PROJECT-COMMON-RELEASE-CHANGELOG` workflow detects the "Summary by CodeRabbit" phrase, it updates the CHANGELOG and automerge proceeds automatically. If automerge fails, it closes the existing PR and retries with a new one.
+
+**Modifies**: nothing (only GitHub API calls)
+**Returns**: the `develop → main` release PR (deploy PR) URL + a notice that the release notes are written
+
+**When to use it**
+- After finishing an implementation, to handle the whole deploy cycle (push → PR → CHANGELOG → merge) in one go
+- When automerge failed and you need to re-trigger it
+
+---
+
+### `/pro-github`
+
+**What does it do?**
+It **looks up and manages** GitHub issues/PRs/comments **independently**. Without any other Skill, it lists issues, changes status, adds comments, and so on. It calls the GitHub API directly and does not use the `gh` CLI.
+
+**Modifies**: GitHub issue/PR state (on request)
+**Returns**: issue/PR lists, details, a completion notice
+
+**When to use it**
+- When you want to list issues quickly or change their status
+- When adding a comment to a PR or changing labels
+- When you want to do GitHub work alone, without any other Skill
+
+---
+
+### `/pro-ssh`
+
+**What does it do?**
+It **connects to any server reachable by SSH** — AWS EC2, Synology NAS, a generic Linux server, and so on — runs commands, and reports the result. It supports both password and PEM key authentication, and if you save server info in `~/.projectops/config/ssh.config.json`, it connects when you just say the name.
+
+**Modifies**: nothing (runs commands on the remote server and only returns the result)
+**Returns**: SSH command output + a summary report
+
+**When to use it**
+- "Show me the server logs", "check prod", "did the deploy go through?"
+- Automatic server state checks after CI/CD finishes
+- Registering several servers in the config and choosing by name
+
+---
+
+## 📝 Document/artifact generation Skills (4)
+
+They do not touch code; they generate **document files** in a specific format.
+
+### `/pro-report`
+
+**What does it do?**
+It checks the changed files with `git status`, selects and reads the files related to the issue, and writes an **implementation report**. It is saved in the form `.report/YYYYMMDD_#issue-number_description.md`.
+
+**Modifies**: a new `.md` file in the `.report/` folder
+**Returns**: a report covering overview, changes, key implementation details, and caveats
+
+**When to use it**
+- When you need a PR description or an internal report after finishing an implementation
+- To summarize the work done for a specific issue
+
+---
+
+### `/pro-testcase`
+
+**What does it do?**
+It reads a GitHub issue, explores the related code, and generates a **QA test checklist**. It includes basic features, edge cases, and extra items by project type. The result is saved as `testcase-[number]-[description].md`, and **you can paste it straight into a GitHub comment**.
+
+**Modifies**: a test case `.md` file
+**Returns**: a list of QA test items in checkbox form
+
+**When to use it**
+- When you need a checklist before handing off to QA
+- When you want to organize manual test scenarios
+
+---
+
+### `/pro-agent-test`
+
+**What does it do?**
+QA that **actually runs apps, web, and servers and goes through them looking for bugs.** It taps the screen (app/web) and sends requests (server), and at each step it cross-checks device storage, browser state, and the server DB. It does not look only at the place it was asked about; it also checks other screens of the same kind and symmetric actions (sign up ↔ withdraw, create ↔ delete) to find consistency defects. If logs are missing, it reports that as an untraceable defect.
+
+**Modifies**: nothing (it does not fix code; it only reports defects)
+**Returns**: per-step evidence (screenshots, comparison tables) · reproduction steps · a defect list by severity
+
+**When to use it**
+- Before a deploy, to confirm the main flows (login, sign-up, payment) really work
+- To reproduce a bug a user hit — the ones unit tests do not catch
+- Problems that only occur in release builds (R8, signing, and manifest problems do not reproduce in debug)
+
+> It differs from `/pro-testcase` (QA document generation) — this Skill **runs** the app.
+
+---
+
+### `/pro-skill-creator`
+
+**What does it do?**
+It manages Skill files in three modes: **create (CREATE), review (REVIEW), and improve (IMPROVE)**. CREATE writes a new SKILL.md in the standard format, REVIEW examines an existing Skill against `common-rules.md` and suggests improvements, and IMPROVE applies the review results by actually editing.
+
+**Modifies**: `skills/{skill-name}/SKILL.md` (in IMPROVE mode)
+**Returns**: a new SKILL.md draft / a review report / an improved SKILL.md
+
+**When to use it**
+- When you want to build a new Skill from scratch to the standard
+- When checking whether an existing Skill matches the latest conventions
+- When you want to apply review results to a Skill right away
+
+---
+
+## Make it yours
+
+Skills write in your style. Put your preferences in `~/.projectops/config/config.json`; nothing is asked on first run, and empty settings mean each skill's default.
+
+```json
+{
+  "preferences": { "language": "en", "tone": "short and direct", "rules": ["no emoji"] },
+  "skills": { "pro-commit": { "preset": "gitmoji" } }
+}
+```
+
+- Layers (later wins): `preferences` → `skills.<skill-id>` → `github.repos[].preferences` → `github.repos[].skills.<skill-id>`.
+- `/pro-commit` picks its format in this order: the team's `issue_helper.commit_template` in `version.yml`, then the projectops format in a repo that has projectops installed, then your `template`, then your `preset` (`conventional` by default; also `projectops`, `gitmoji`, `custom`).
+- Preferences change presentation only. Approval gates, secret protection, `--dry-run` and the push ban cannot be turned off.
+- Details: [`skills/references/preferences.md`](https://github.com/Cassiiopeia/projectops/blob/main/skills/references/preferences.md).
+
+---
+
+## Extras (optional plugin)
+
+`/pro-synology-expose` (a guide for exposing a Synology NAS service on an external domain), `/pro-skill-bug` (report a projectops skill bug) `/pro-disk-cleanup` (free disk space safely), `/pro-remote-link` (a link to open Orca or Paseo from outside), `/pro-project-blueprint` (start a project the owner's way) and `/pro-brain` (a knowledge note per issue for a team brain) are not in the core plugin. They live in the optional `projectops-extras` plugin. (`/pro-code-consult` moved to the core plugin.)
+
+```bash
+# Claude Code
+claude plugin install projectops-extras@projectops-marketplace --scope user
+# Codex CLI: run `codex plugin marketplace add Cassiiopeia/projectops`, then install projectops-extras from the plugin list
+```
+
+Cursor, Gemini CLI and pi have no extras install path. `npx projectops` removes the skill on its next sync. To keep it, copy both `plugins/projectops-extras/skills/<skill folder>` and `plugins/projectops-extras/skills/references/` from this repository by hand.
+
+The preferences reader (`prefs_cli.py`) ships with the core plugin. With extras alone, skills cannot find it and run with default preferences. Install the core plugin as well to use your preferences.
+
+### `/pro-skill-bug`
+
+**What does it do?**
+It **reports a suspected projectops skill bug from the current session**. It gathers the commands, results, flow, logs and screenshots from the session transcript, strips personal data, and files an issue in `Cassiiopeia/projectops` (or comments on an open issue with the same symptom). Then it goes back to what you were doing. It does not judge whether it really is a bug, look for the cause, or fix anything.
+
+In Claude Code, an extras hook watches every projectops CLI and starts this skill in a background subagent on its own when it sees a suspected bug: a failed command followed by a hand-made workaround, a tool answering that it has no such feature, the same usage error twice, the same failure three times, or a crash inside a projectops file. At most 3 reports per session. To turn the automatic reports off, set `"skill-bug": {"auto_report": false}` in `~/.projectops/config/config.json`.
+
+**Modifies**: nothing locally (creates an issue or a comment in `Cassiiopeia/projectops`)
+**Returns**: one line with the issue link, new or comment
+
+**When to use it**
+- A `pro-*` tool's result does not match what really happened
+- You keep repeating the same command, or had to work around a skill to finish
+- "Is this a bug?" — call it even when unsure
+
+---
+
+### `/pro-disk-cleanup`
+
+**What does it do?**
+It **finds reclaimable disk space and clears it safely** on macOS, Windows and Linux, for any stack. It starts with a read-only `scan` and sorts what it finds into three tiers:
+
+| Tier | What is in it | How it is cleared |
+|---|---|---|
+| safe | Build output inside worktrees, browser caches, a tool's own clean-up (npm, pip, Homebrew, ...) | After one confirmation |
+| decide | Open-issue worktrees, emulator images, DerivedData, Gradle caches, Trash, unknown big folders | Only when you name the item |
+| keep | Login profiles, `.git`, branches, stashes, history | Never |
+
+Every deleting command only prints a plan unless it gets `--yes`. A worktree is removed only after GitHub confirms its issue is closed, it is not in use or recently touched, and a backup (patches and small unique files) is made; the branch is kept.
+
+**Modifies**: only what you confirmed (safe tier) or named (decide tier)
+**Returns**: free space before and after, what was removed, what was kept and why, backup locations
+
+**When to use it**
+- "The disk is full", "free up space", "what is eating my disk"
+- "Clean up the finished worktrees", "delete build folders"
+
+---
+
+### `/pro-remote-link`
+
+**What does it do?**
+It **answers "give me the Orca link" or "give me the Paseo link" with one link you can open from anywhere**. Each app connects its own way:
+- **Orca (tunnel)**: reuses the running cloudflared quick tunnel for Orca Web (or opens a new one), then returns your saved Orca pairing link with the tunnel address swapped in. No Cloudflare account is needed; only `cloudflared` must be installed.
+- **Paseo (relay)**: no tunnel. The Paseo CLI (`paseo daemon pair`) makes a fresh `https://app.paseo.sh/#offer=...` link every time. If the relay is off it asks you before turning it on, and if the daemon has no password it adds a warning with the command to set one. It never restarts the daemon, changes its listen address or turns on the web UI.
+
+App-specific facts (port, CLI location, link shape) live in one harness file per app that the agent updates when the app changes. The `apps` command lists the supported apps and whether each is running and reachable now. A new app needs one harness file and a small adapter. Works on macOS, Windows and Linux.
+
+**Modifies**: starts or stops quick tunnels; saves the Orca pairing link in an owner-only file under `~/.projectops/remote-link/`
+**Returns**: one link (it is a key to your computer, so it is sent only to you in the chat)
+
+**When to use it**
+- "Give me the Orca URL", "Paseo link", "open Orca / Paseo from outside"
+- You are away from the computer and want Orca or Paseo desktop in a browser
+
+---
+
+### `/pro-project-blueprint`
+
+**What does it do?**
+It **holds the owner's house standard for starting and running a project**, so a new repo is set up without explaining it again: monorepo layout (stack folders, `brand/`, `docs/superpowers/specs/`, a root `CLAUDE.md` index with per-stack files, `version.yml`), three branch tiers (issue branch > `develop` > `main` > `deploy`, promoted by a merged PR), secrets in a public repo (workflow secrets one value each, runtime secrets as one whole file per platform such as `APPLICATION_PROD_YML` or `ENV_FILE`, written read-only to the server and backed up to the NAS), and the NAS deploy (Docker Hub sha tags, Traefik Blue-Green, reverse proxy, shared PostgreSQL). Infra values that repeat across projects live in the `project-blueprint` section of your private `~/.projectops/config/config.json`; the skill ships only a placeholder sample.
+
+**Modifies**: nothing by itself; it decides the answers and hands the work to `pro-github`, `npx projectops`, `pro-synology-expose` and `pro-ssh`
+**Returns**: the setup checklist filled in for this project
+
+**When to use it**
+- "Start a new project", "set this repo up like my other ones"
+- "Where does this new secret key go?", "split deploy from main"
+
+---
+
+### `/pro-brain`
+
+**What does it do?**
+It **keeps what stays true about the project** (the decision, why, and what the next person must not trip over) as short notes in the repo's knowledge folder, committed with the work, so a brain that syncs the folder (team or personal) learns it. Code shows what; the note keeps why and where. It is on only when the repo's `version.yml` says so (`metadata.template.options.knowledge`), so every teammate who clones the repo gets the same behavior. It changes a brain only when you agree: one new source in your own local GBrain, or one team brain MCP entry. A team brain token lives only in your own credential store (`~/.projectops/config/config.json`) under a name, never in the repo, a note, `version.yml` or the chat.
+
+**How it works (for owners)**
+- The first run asks at most three questions, each with a recommended answer: **when** to write notes (after each finished issue, at the end of a work session, on each merge, or only when asked; recommended from the repo's history), and **may it add the knowledge rule to the project CLAUDE.md** (tells every agent when to capture and to search the team brain first for "why" questions). A no is remembered. If CLAUDE.md is gitignored, it offers a small committed `.claude/rules/pro-brain.md` instead, or copies CLAUDE.md into new worktrees on this machine.
+- The third question is **how you use this repo's knowledge**: repo only (default), your own local GBrain (it adds the folder as one source `<project>-knowledge` and syncs it, and stops if that name is taken), your own remote GBrain (commands to run on its host), a team brain server (name, address and who issues read-only tokens are saved in `version.yml` after a check that the address answers like a brain, which catches a mistyped brain key; each member types their own read-only token once in a terminal and says yes to `connect --team`, `--rotate` after a new token), or an install guide (one question: only you on this computer, your own Postgres, Supabase, another machine or a team server, then the exact commands and how to check them). Personal and team can be combined; run setup again to see and change what is in effect.
+- After that the agent writes notes at the right moment and skips trivial work with one line. Notes reach the team brain once merged into the main branch: no extra service, no AI cost in CI.
+- A note has a searchable title, stable id, tags, links to related notes, facts collected automatically (version, commit range, files, API endpoints, migrations, setting and secret **names**, never values) and 30 to 80 lines of prose: background, decision with reasons and rejected alternatives, behavior change, code pointers, cautions, verification. No code dumps or logs.
+- `gaps` lists work merged into the main branch that has no note yet, from git history only, so a brain's sync job can log it for free.
+
+**Modifies**: notes in the knowledge folder (plus files the repo's own vault rules require); once, after you agree, the `version.yml` switch and one marked rule block
+**Returns**: the note path and the sync target known on this machine, or the reason it was skipped
+
+**When to use it**
+- Right after `pro-report` (issue repos), after a feature commit or at the end of a session, or after a merge, as the repo's mode says
+- "Save this decision to the team brain", "write the knowledge note", "set up pro-brain", "connect this repo to my GBrain", "which merged work has no note?"
+
+
+---
+
+### `/pro-synology-expose`
+
+**What does it do?**
+It **walks you through exposing a web service on a Synology NAS** (in Docker or similar) on your own domain over HTTPS, in a fixed order: DNS record (Cloudflare, Route53, others) → two DSM reverse proxy rules (443 → local port, 80 → 443, plus WebSocket headers when needed) → Let's Encrypt certificate. It infers the service name, subdomain, port and WebSocket use from what you give it and asks only for what is missing.
+
+**Modifies**: nothing on the NAS by itself (it guides you); it saves your NAS details in `~/.projectops/config/config.json`
+**Returns**: step-by-step settings for your service and a final checklist
+
+**When to use it**
+- "Put this service on a subdomain", "add a reverse proxy", "set up HTTPS"
+- A new Docker service on the NAS needs a public address
+
+---
+
+## Which Skill when?
+
+The actual work order is **register issue → separate work environment → plan → implement → test → review → report**.
+
+### Standard development flow (full cycle)
+
+```mermaid
+flowchart TD
+    A(["Start work"]) --> B["/pro-github<br/>Register issue"]
+    B --> C["/pro-init-worktree<br/>worktree + copy sensitive files"]
+    C --> D{"Type of work?"}
+
+    D -->|New feature, design, refactor| E1["superpowers:brainstorming<br/>Decide what to build and why"]
+    D -->|Bug, incident| E2["superpowers:systematic-debugging<br/>Find the root cause"]
+
+    E1 --> F1["superpowers:writing-plans<br/>Write the implementation plan"]
+    F1 --> G1["superpowers:executing-plans<br/>Execute the plan"]
+    E2 --> G1
+
+    G1 --> H["/pro-review<br/>Self-review"]
+    H --> I["/pro-commit<br/>Issue-linked commit"]
+    I --> J["/pro-report<br/>Implementation report + GitHub comment"]
+    J --> J2["/pro-brain<br/>Knowledge note (when the repo turns it on)"]
+    J2 --> K(["Open PR"])
+    K --> L["/pro-changelog-deploy<br/>Release PR + automerge"]
+```
+
+
+### Flow by scenario
+
+| Situation | Recommended flow |
+|------|----------|
+| **New feature development (standard)** | `pro-github` → `pro-init-worktree` → `brainstorming` → `writing-plans` → `executing-plans` → `pro-review` → `pro-commit` → `pro-report` → `pro-brain` (when on) → `pro-changelog-deploy` |
+| **Bug fix** | `pro-github` → `pro-init-worktree` → `systematic-debugging`(root cause) → `executing-plans` → `pro-commit` → `pro-report` → `pro-brain` (when on) → `pro-changelog-deploy` |
+| **Refactor, design change** | Same as new feature development (start by narrowing the scope in `brainstorming`) |
+| **QA test cases** | `pro-github` → `pro-testcase` |
+| **Real-run verification (app, web, server)** | `pro-agent-test` → (if a problem is found) `pro-github` → `pro-commit` |
+
+### Single tasks (called alone, outside the cycle)
+
+| Situation | Skill to use |
+|------|----------|
+| Only a code review is needed | `pro-review` |
+| Create, read or close issues and PRs, comments, labels, Actions logs, secrets | `pro-github` |
+| Commit with a message built from the issue in the branch name | `pro-commit` |
+| Create a deploy PR + automerge, or re-trigger a failed automerge | `pro-changelog-deploy` |
+| Generate a PR description / implementation report | `pro-report` |
+| Write a QA checklist (document only) | `pro-testcase` |
+| Actually run the app, web or server to find bugs | `pro-agent-test` |
+| Start, drive and capture an app, emulator, browser or server | `pro-launch` |
+| Press through an installer, OS dialog or desktop app | `pro-desktop-control` |
+| Create a worktree and copy the local files it needs | `pro-init-worktree` |
+| SSH into a remote server and run commands | `pro-ssh` |
+| Move a Figma design into code and compare it with the design | `pro-figma` |
+| Show UI mockups to compare and pick, or request a design | `pro-ui-design` |
+| Make an image asset in the project's style | `pro-image` |
+| Build a talk deck and rehearse it | `pro-presentation` |
+| Audit or refactor AI-written code against your conventions | `pro-code-consult` |
+| Diagnose a repo as an open-source project | `pro-oss-consult` |
+| Create/review/improve a Skill | `pro-skill-creator` |
+
+---
+
+## References
+
+- Skill source: the `skills/` folder of this repository (the common source for Claude/Gemini/Codex/Cursor)
+- Claude Code manifests: `.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json`
+- Gemini CLI manifests: `gemini-extension.json`, `GEMINI.md`
+- Codex CLI marketplace/bootstrap/metadata: `.agents/plugins/marketplace.json`, `AGENTS.md`, `.codex-plugin/plugin.json`
+- Version sync: when `version.yml` changes, the `PROJECT-TEMPLATE-PLUGIN-VERSION-SYNC` workflow applies it automatically

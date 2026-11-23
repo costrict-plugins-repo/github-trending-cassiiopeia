@@ -1,0 +1,671 @@
+# Agent Skills 가이드
+
+> **이 레포는 Claude Code, Cursor, Gemini CLI, Codex CLI에서 사용할 수 있는 Agent Skill 패키지입니다.**
+> GitHub Actions 자동화 템플릿과 더불어, 개발/DevOps Skill 18종을 제공합니다.
+
+---
+
+## Skill이 뭔가요?
+
+Skill은 특정 작업(예: 코드 리뷰, 이슈 작성, 리팩토링)에 특화된 지침과 출력 포맷을 가진 **전문가 모드**입니다. Claude Code에서는 `/pro-<skill>` 형태(예: `/pro-review`)로 호출하고, Gemini CLI는 extension, Codex CLI는 plugin marketplace를 통해 이 레포의 `skills/`를 읽습니다.
+
+예를 들어 `/pro-review`를 실행하면 Claude가 단순히 "코드 좀 봐줘"에 답하는 게 아니라, **보안/성능/버그/품질/아키텍처/테스트 6가지 관점**으로 나눠서 **Critical/Major/Minor 우선순위**로 정리된 리뷰를 돌려줍니다.
+
+---
+
+## 설치
+
+### Claude Code
+
+```bash
+claude plugin marketplace add Cassiiopeia/projectops
+claude plugin install projectops@projectops-marketplace --scope user
+```
+
+설치 후 Claude Code에서 `/pro-` 까지 입력하면 사용 가능한 Skill 목록이 자동완성됩니다.
+
+### Cursor
+
+`npx projectops`의 `skills` 모드를 사용하면 `skills/`가 Cursor용 경로로 복사됩니다.
+
+```bash
+# macOS / Linux / Windows 공통
+npx projectops --mode skills
+```
+
+대화형 메뉴에서 `Agent Skill 설치`를 선택한 뒤 Cursor scope를 고르면 됩니다.
+
+### GitHub Copilot
+
+GitHub Copilot(VS Code 채팅·JetBrains IDE·Copilot CLI)은 개인 Agent Skill을 `~/.copilot/skills/<이름>/SKILL.md`에서 읽습니다.
+`npx projectops --mode skills`에서 `GitHub Copilot`을 고르면 `skills/`는 `~/.copilot/skills/`로, 스킬 CLI가 쓰는 공용 파이썬(`scripts/` 중 런타임 파일만)은
+`~/.copilot/scripts/`로 복사되고, 고정 진입점 `~/.projectops/bin/projectops_cli.py`도 함께 깔립니다.
+copilot CLI, `~/.copilot` 폴더, VS Code Copilot 확장, JetBrains Copilot 플러그인 중 하나가 있어야 설치 대상으로 나타납니다.
+JetBrains IDE는 `Settings > GitHub Copilot > Chat > Agent`에서 Skills를 켜야 합니다. `~/.copilot/intellij-skills/`는 플러그인이 관리하는 폴더라 건드리지 않습니다.
+
+```bash
+npx projectops --mode skills
+```
+
+설치 후 Copilot 채팅에서 `/pro-`를 입력하면 Skill 목록이 나옵니다.
+
+### Gemini CLI
+
+Gemini CLI는 extension으로 설치합니다.
+
+```bash
+gemini extensions install https://github.com/Cassiiopeia/projectops
+```
+
+업데이트:
+
+```bash
+gemini extensions update projectops
+```
+
+설치 후 Gemini는 루트 `gemini-extension.json`의 `contextFileName`에 따라 `GEMINI.md`를 읽고, `skills/{skill-name}/SKILL.md`를 참조합니다.
+
+### Codex CLI
+
+Codex는 plugin marketplace source로 이 레포를 등록합니다. OpenAI 공식 marketplace 등재가 아니라, 사용자가 직접 신뢰한 GitHub repo를 marketplace source로 추가하는 흐름입니다.
+
+**방법 1 (기본):** Plugin marketplace 등록
+
+macOS / Linux:
+
+```bash
+codex plugin marketplace add Cassiiopeia/projectops
+```
+
+마법사 설치:
+
+```bash
+npx projectops --mode skills
+```
+
+마법사는 Codex marketplace를 등록합니다. 등록 후 `/plugins`에서 `projectops` 항목을 확인하세요.
+
+업데이트:
+
+```bash
+codex plugin marketplace upgrade projectops
+```
+
+**방법 2 (Fallback):** git clone + symlink로 즉시 활성화
+
+marketplace 명령이 없거나 즉시 사용이 필요한 환경에서 사용합니다.
+
+macOS / Linux:
+
+```bash
+git clone https://github.com/Cassiiopeia/projectops.git ~/.codex/projectops
+mkdir -p ~/.agents/skills
+ln -s ~/.codex/projectops/skills ~/.agents/skills/projectops
+```
+
+Windows PowerShell:
+
+```powershell
+git clone https://github.com/Cassiiopeia/projectops.git "$env:USERPROFILE\.codex\projectops"
+New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.agents\skills"
+cmd /c mklink /J "%USERPROFILE%\.agents\skills\projectops" "%USERPROFILE%\.codex\projectops\skills"
+```
+
+Codex에서는 slash command UI가 아니라 `AGENTS.md`와 설치된 `skills/`를 통해 관련 `SKILL.md`를 읽는 방식으로 사용합니다.
+
+---
+
+## Skill 전체 목록 (18종)
+
+용도에 따라 네 그룹으로 나뉩니다:
+
+- **분석형** (1종) — 코드를 읽기만 하고 수정하지 않음. 계획/리뷰/진단 결과를 돌려줌.
+- **구현형** (9종) — 실제로 파일을 수정하거나 생성함.
+- **개발 사이클 자동화형** (4종) — 커밋, 배포, GitHub 작업, 서버 점검을 대신 수행함.
+- **문서/산출물 생성형** (4종) — 코드는 건드리지 않고, `.md` 파일이나 보고서를 생성함.
+
+> 설계·계획·구현 흐름은 이 플러그인이 아니라 `superpowers`(brainstorming → writing-plans → executing-plans)가 담당합니다.
+
+
+---
+
+## 📊 분석형 Skill (1종)
+
+코드를 수정하지 않습니다. "먼저 상황을 파악하고 싶을 때" 사용하세요.
+
+### `/pro-review`
+
+**무엇을 하나요?**
+코드를 **보안/성능/버그/품질/아키텍처/테스트 6가지 관점**으로 리뷰합니다. 발견한 이슈를 **Critical / Major / Minor**로 분류해서 돌려주고, 잘한 점도 같이 짚어줍니다.
+
+**수정되는 것**: 없음
+**돌려주는 것**: 우선순위별 리뷰 코멘트 + 개선 제안
+
+**언제 쓰나요?**
+- PR 올리기 전 셀프 리뷰
+- 특정 파일이나 함수에 대한 2차 검토
+- 구현 완료 후 "빠뜨린 거 없나?" 확인
+
+---
+
+## 🔧 구현형 Skill (9종)
+
+실제로 파일을 수정합니다. "작업을 진행해달라"일 때 사용하세요.
+
+### `/pro-figma`
+
+**무엇을 하나요?**
+Figma 시안을 **코드로 옮기고, 옮긴 것이 시안과 같은지 셉니다.** 덤프의 채움·테두리·효과·배치를 하나도 빠짐없이 나열해 작업 목록으로 삼고, 반응형 단위로 옮긴 뒤, 시안 그림과 앱 화면을 픽셀로 맞대 어긋난 자리를 짚어 줍니다.
+
+**수정되는 것**: 해당 컴포넌트 파일
+**돌려주는 것**: 분류표 + 반응형 코드 + 픽셀 대조 결과(차이 그림 포함)
+
+**언제 쓰나요?**
+- 디자이너가 전달한 화면을 코드로 옮길 때
+- 옮긴 화면이 시안과 같은지 확인할 때
+- 디자이너가 "이거 다른데요"라고 한 뒤 무엇이 다른지 특정할 때
+
+> 옮기는 일과 세는 일이 한 스킬입니다. 나눠 두면 옮기는 쪽이 무엇을 옮겨야 하는지 모르는 채로 그림만 보고 만들게 됩니다 — 실제로 효과 네 줄 중 세 줄이 빠진 채 배포된 적이 있습니다.
+
+---
+
+### `/pro-oss-consult`
+
+**무엇을 하나요?**
+GitHub 레포를 **오픈소스 프로젝트로서 진단**합니다. 레포 성격(배포형 앱·작은 도구·CLI·문서·템플릿 등)을 먼저 판별하고, 첫인상·가치 증명·커뮤니티·코드 확장성·법적 안전·장기 운영 6축으로 깐깐하게 채점한 뒤, 성숙도 단계와 다음 단계 선행 조건을 알려줍니다. 사실 수집은 스크립트가, 판단은 에이전트가 합니다.
+
+**수정되는 것**: 승인한 것만 — About·topics·Discussions·라벨(이 스킬의 CLI), 새 브랜치에 추가하는 문서 파일. 레포마다 계획을 보여주고 승인받으며, 가시성 변경·삭제·라이선스 교체는 하지 않고 제안만 합니다.
+**돌려주는 것**: 진단 보고서(6축 점수·결함·개선안·성숙도), 계정 전체 일괄 점검이면 점수판
+
+**언제 쓰나요?**
+- 내 레포가 다른 사람에게 찾아가고 기여받을 만한 상태인지 점검할 때
+- 막 공개한 레포의 공개 차단 사항(커밋된 비밀·라이선스·개인정보)을 확인할 때
+- 계정이나 조직의 레포 전체를 한 번에 훑어 우선순위를 잡을 때
+
+> 이슈·PR·댓글 작업 자체는 `/pro-github`, 코드 변경분 리뷰는 `/pro-review`입니다.
+
+**예시: 이 레포.** 이 레포에 `/pro-oss-consult`를 돌리고, 찾아낸 문제를 고쳤습니다 (측정일 2026-10-13).
+
+| 항목 | 전 | 후 |
+|---|---|---|
+| README·매니페스트의 스킬 수 표기 | 불일치 (15 vs 20 표기, 실제 15) | 일치: 코어 14 + 선택 extras 플러그인 1 |
+| 가장 긴 스킬 description | 1,183자, 1,000자 초과 6개 | 237자, 300자 초과 0개 |
+| 커밋 형식 | `pro-commit`에 고정 | 선호 설정과 `version.yml`로 조정 가능 |
+
+바뀐 것: description을 짧은 영어 트리거로 줄이고, 가드 테스트로 코어 스킬 문서를 검사하며, `pro-commit`이 팀의 `version.yml` 커밋 템플릿을 따릅니다.
+
+---
+
+### `/pro-init-worktree`
+
+**무엇을 하나요?**
+브랜치명만 주면 **Git worktree를 자동으로 생성**하고, `.gitignore`를 분석해서 원본 프로젝트에 존재하는 로컬 설정 파일 후보를 찾습니다. 에이전트가 후보별 복사 필요성을 판단해 필요한 파일만 근거와 함께 선택 복사하고, 복사하지 않은 후보도 마지막에 리포트합니다. UTF-8 인코딩 문제도 처리합니다.
+
+**수정되는 것**: 새 worktree 디렉토리 생성 + 필요한 로컬 설정 파일 선택 복사
+**돌려주는 것**: 생성된 worktree 경로 + 복사/스킵/누락 후보 리포트
+
+**언제 쓰나요?**
+- PR마다 별도 worktree로 작업하고 싶을 때
+- `.env`, Firebase 설정, 서명 키, 로컬 빌드 설정처럼 worktree에도 필요한 파일을 놓치고 싶지 않을 때
+
+---
+
+### `/pro-launch`
+
+**무엇을 하나요?**
+앱·웹·서버를 띄우고, 조작하고, 찍는 **능력 스킬**입니다. Android 에뮬레이터·iOS 시뮬레이터 화면을 상태바를 고정해 찍고, 브라우저를 열어 이동·클릭·입력·캡처합니다. 폭을 바꾸거나 API 응답을 바꿔치기해 빈 목록·실패·로딩 상태를 서버를 건드리지 않고 연출할 수 있습니다. 단건 HTTP 요청, DB 조회, 서버 로그도 적어 둔 접속 방법대로 실행합니다.
+
+**수정되는 것**: 없음 (캡처와 실행 기록만 저장)
+**돌려주는 것**: 캡처 이미지 + 실행 결과 JSON
+
+**언제 쓰나요?**
+- "에뮬레이터 띄워서 찍어줘", "모바일 폭으로 캡처해줘"
+- 빈 목록·500 에러 같은 상태 화면이 필요할 때
+- 다른 스킬(`pro-agent-test`, `pro-ui-design`, `pro-figma`)이 화면을 찍어야 할 때
+
+> 버그를 찾으며 끝까지 밟는 QA는 `/pro-agent-test`입니다. 이 스킬은 "띄우고 찍는 도구"입니다.
+
+**웹 로그인** — 브라우저에서 Google, Apple, Naver, Kakao, GitHub에 로그인합니다. 이미 로그인된 프로필을 먼저 재사용하고, 계정은 저장해 둔 자격 증명에서 가져오며, 2단계 인증·캡차·패스키 화면은 사용자에게 넘깁니다. Apple 로그인 코드가 에이전트가 도는 Mac으로 오면, 사용자가 동의한 경우에만 시스템 알림에서 코드를 읽어 입력합니다. 자세히: [`web-sign-in.md`](https://github.com/Cassiiopeia/projectops/blob/main/skills/pro-launch/references/web-sign-in.md)
+
+**올리기 전에 개인정보 가리기** — `mask`는 스크린샷의 지정 영역을 단색으로 덮고, `redact`는 로그에서 알려진 비밀값·개인정보 형식을 지웁니다. 둘 다 새 파일(`<이름>.masked<확장자>`, `<이름>.redacted<확장자>`)을 만들고 원본은 바꾸지 않습니다. 첨부는 새 파일만 합니다. 자세히: [`evidence.md`](https://github.com/Cassiiopeia/projectops/blob/main/skills/pro-launch/references/evidence.md)
+
+**하네스 폴더** — 하네스는 반복하는 사이트·작업마다 두는 폴더 하나입니다. 에이전트가 따라 하는 안내서 `README.md`와 선택 도우미 스크립트가 들어갑니다. 이 컴퓨터 전체용(`~/.projectops/launch/_machine/harness/<이름>/`)이나 레포 하나용으로 두며, 맞는 URL·호스트·앱·창을 열면 자동으로 다시 보여 줍니다. 사이트를 더하려면 코드가 아니라 폴더를 더합니다. 자세히: [`harness.md`](https://github.com/Cassiiopeia/projectops/blob/main/skills/pro-launch/references/harness.md)
+
+---
+
+### `/pro-desktop-control`
+
+**무엇을 하나요?**
+웹 페이지도 에뮬레이터도 아닌, **이 컴퓨터 화면의 프로그램**을 조작합니다. 설치 마법사의 "다음"을 누르고, OS 대화상자(파일 열기·권한 확인)에 답하고, 데스크톱 앱의 설정을 바꿉니다. 화면 요소를 읽어 고르고, 되도록 마우스를 움직이지 않고 누릅니다. 설치·약관 동의처럼 무언가를 바꾸는 버튼은 누르기 전에 묻고, 관리자 권한(UAC) 같은 보안 확인 창은 사용자에게 넘깁니다. `/pro-launch`의 `desktop` 명령 묶음 위에 얹은 절차 스킬입니다. Windows와 macOS를 지원합니다. macOS에서는 알림과 시스템 대화상자(Apple 계정 로그인 승인 알림과 확인 코드 창 등)도 다루며, 로그인 승인은 항상 먼저 묻습니다.
+
+**수정되는 것**: 코드는 없음. 화면 속 프로그램 상태(설치·설정)는 사용자가 승인한 버튼만큼만 바뀝니다
+**돌려주는 것**: 누른 버튼 이름 + 지금 화면 상태 + 사용자에게 남은 일 (결과가 화면일 때만 캡처)
+
+**언제 쓰나요?**
+- "설치 프로그램 다음 눌러줘", "이 설치 마법사 끝까지 진행해줘"
+- "저 대화상자 확인 눌러줘", "이 프로그램 설정 바꿔줘"
+- 웹 흐름이 내려받은 프로그램(보안 모듈 설치, 인증서 도구)으로 넘어갈 때
+
+> 브라우저 안의 페이지는 `/pro-launch`의 `web`, 에뮬레이터·시뮬레이터 화면은 `app`이 맡습니다. 버그를 찾는 QA는 `/pro-agent-test`입니다.
+
+---
+
+### `/pro-code-consult`
+
+**무엇을 하나요?**
+AI가 짠 코드를 **사람이 1년 동안 유지할 수 있는 코드**로 만듭니다. 코딩 규칙 기준으로 점검하고(주석 과잉·낡은 주석·공통 코드 재사용 안 함·계층 역방향 의존·큰 파일과 약어), 승인받은 항목을 하나씩 리팩터링하며 전후 실행 결과를 대조합니다. 변경분만 검사하는 모드도 있고, 기존 위반은 동결 목록(`docs/architecture/rules/`)으로 묶어 줄어들기만 하게 합니다. 사실 수집은 스크립트가, 판단은 에이전트가 합니다.
+
+**수정되는 것**: 승인한 리팩터링 대상 파일, 동결 목록, 규칙 테스트(Flutter·Spring·Python·JavaScript)
+**돌려주는 것**: 점검 보고서 + 원인별 묶음 + 리팩터링 설계안
+
+**언제 쓰나요?**
+- "코드 엉망인 것 같은데 전체적으로 봐줘"
+- 커밋 전에 방금 짠 코드의 주석·이름·중복 확인
+- 새 프로젝트에 내 코딩 규칙과 규칙 테스트 깔기
+
+---
+
+### `/pro-image`
+
+**무엇을 하나요?**
+프로젝트 화풍에 맞는 이미지 에셋(배경, 캐릭터, 아이콘, 일러스트, 아이템)을 만듭니다. 에이전트가 레포의 그림 하네스(화풍, 캐릭터, 참조 그림, 지난 승인 기록)를 읽고 대충 한 요청을 빠짐없는 프롬프트로 바꾸면, Codex(ChatGPT 구독)나 Antigravity가 그리고, CLI가 크기와 진짜 투명 배경까지 맞춥니다. 화풍이 정해지지 않았으면 같은 대상을 여러 화풍으로 그려 비교판으로 보여 주고 고르게 합니다.
+
+**수정 대상**: 승인한 그림만 앱 폴더에, 하네스는 `docs/image-harness/` (후보는 Git 밖 `~/.projectops/image/`)
+**결과물**: 완성 그림 (요청 크기, 필요하면 투명 PNG), 비교판, 생성 기록
+
+**언제 쓰나요?**
+- "이 화면 배경 만들어줘", "캐릭터 표정 여러 개 만들어줘", "앱 아이콘 만들어줘"
+- "어떤 그림체가 우리 앱에 어울려?", "화풍 몇 개 보여줘"
+
+> 화면 배치 시안 비교는 `/pro-ui-design`, Figma 시안을 코드로 옮기는 것은 `/pro-figma`입니다.
+
+---
+
+### `/pro-ui-design`
+
+**무엇을 하나요?**
+UI 시안을 로컬 주소에 띄워 비교하고 고르게 합니다. 레포의 실제 토큰과 글꼴을 쓰고, 실제 코드 렌더도 넣을 수 있으며, 시안이 실제로 움직입니다. 애니메이션을 느리게 비교하거나, 한 화면의 조작이 다른 화면을 바꾸는 연결 프로토타입을 직접 눌러 볼 수 있습니다. 그다음 고른 안을 구현하거나, PNG·GIF를 이슈에 올리거나, 상태별 캡처와 문구 후보를 담은 요청서로 디자이너에게 넘깁니다.
+
+**수정 대상**: Git에는 없음 (시안은 Git 제외 폴더에 저장)
+**결과물**: 로컬 주소, 결정 기록, 선택에 따라 이슈 댓글 또는 디자인 요청서(이슈, HTML, md)
+
+**언제 쓰나요?**
+- "시안 몇 개 보여줘", "애니메이션 시안 비교해줘", "이 흐름 눌러 보게 해줘"
+- "시안 캡처해서 이슈에 올려줘"
+- "디자인 요청해줘", "빈 화면이랑 에러 화면도 그려 달라고 해줘"
+
+> 이미 있는 Figma 시안을 코드로 옮기고 대조하는 것은 `/pro-figma`입니다.
+
+---
+
+### `/pro-presentation`
+
+**무엇을 하나요?**
+발표를 HTML 덱으로 짓고, 한 장씩 말로 연습합니다. 에이전트가 발표 말투 규칙으로 문제 있는 곳만 짧게 짚고, 말한 버전과 피드백을 장마다 쌓고, 사용자가 말한 방향은 발표 메모리에 적어 모든 장에 반영합니다. 연습 화면은 파일이 바뀌면 바로 새로고침됩니다. 녹화 주소를 주면 자막으로 장별 시간을 나눠 지난 녹화와 비교하고, 덱을 PDF와 글자를 고칠 수 있는 PPT로 뽑아 HTML과 대조해 검수합니다.
+
+**수정 대상**: Git에는 없음 (덱 폴더가 스스로 Git 제외)
+**결과물**: 덱 폴더, 로컬 연습 주소, 장별 시간 비교, PDF·PPT와 검수 결과
+
+**언제 쓰나요?**
+- "발표 연습하자", "발표 자료 만들어줘", "이 PPT로 연습하자"
+- "녹화 올렸어, 비교해줘"
+- "PPT로 뽑아줘", "PDF로 내보내줘"
+
+> 심사기준 채점과 질의응답 연습은 pro-judge가 설치돼 있으면 함께 씁니다.
+
+---
+
+## 🔄 개발 사이클 자동화 Skill (4종)
+
+이슈 등록부터 커밋, 배포, 서버 점검까지 — 반복 작업을 AI가 대신합니다.
+
+### `/pro-commit`
+
+**무엇을 하나요?**
+`/pro-github`의 이슈 생성이나 `/pro-init-worktree`가 저장해둔 이슈 컨텍스트(`.projectops/context/current-issue.json`)를 읽어서 **프로젝트 커밋 컨벤션에 맞는 메시지를 자동 완성**하고 커밋합니다. 메시지는 반드시 제안 후 사용자 확인을 받고 실행합니다.
+
+**수정되는 것**: git 커밋 (staged 파일 기준)  
+**돌려주는 것**: `이슈제목 : 타입 : 변경사항 설명 이슈URL` 형식의 완성된 커밋
+
+**커밋 컨벤션**:
+```
+이슈제목 : feat : 변경사항 설명 https://github.com/.../issues/123
+```
+
+**이슈 컨텍스트가 없을 때**:
+1. 이슈 새로 만들기 (`/pro-github` 이슈 생성 플로우 안내)
+2. 이슈 번호 직접 입력 (GitHub에서 정보 자동 조회)
+3. 이슈 없이 자유 형식 커밋
+4. 취소
+
+**superpowers 원칙 준수**:
+- staged 파일 없으면 `git add`를 대신하지 않음 — 사용자가 직접 스테이징
+- 사용자 확인 없이 절대 커밋 실행 안 함
+- `git push`는 절대 실행하지 않음 — 커밋까지만 담당
+
+**언제 쓰나요?**
+- 이슈 번호/URL을 커밋 메시지에 매번 복사붙여넣기하는 게 귀찮을 때
+- 팀 커밋 컨벤션을 일관되게 유지하고 싶을 때
+
+---
+
+### `/pro-changelog-deploy`
+
+**무엇을 하나요?**
+`develop` 브랜치를 push 후 `main`으로 릴리스 PR(`deploy` PR)을 생성하고, **릴리스 노트를 직접 작성**해서 PR 본문에 올립니다. `PROJECT-COMMON-RELEASE-CHANGELOG` 워크플로우가 "Summary by CodeRabbit" 문구를 감지하면 CHANGELOG 업데이트 후 automerge가 자동 진행됩니다. automerge에 실패하면 기존 PR을 닫고 새로 재시도합니다.
+
+**수정되는 것**: 없음 (GitHub API 호출만)
+**돌려주는 것**: `develop → main` 릴리스 PR(deploy PR) URL + 릴리스 노트 작성 완료 안내
+
+**언제 쓰나요?**
+- 구현 완료 후 배포 사이클 전체(push → PR → CHANGELOG → 머지)를 한 번에 처리하고 싶을 때
+- automerge가 실패해서 재트리거가 필요할 때
+
+---
+
+### `/pro-github`
+
+**무엇을 하나요?**
+GitHub 이슈/PR/댓글을 **독립적으로 조회하고 관리**합니다. 다른 스킬 없이 단독으로 이슈 목록 조회, 상태 변경, 댓글 추가 등을 수행합니다. GitHub API를 직접 호출하며 `gh` CLI를 사용하지 않습니다.
+
+**수정되는 것**: GitHub 이슈/PR 상태 (요청 시)
+**돌려주는 것**: 이슈/PR 목록, 상세 정보, 작업 완료 안내
+
+**언제 쓰나요?**
+- 이슈 목록을 빠르게 조회하거나 상태를 바꾸고 싶을 때
+- PR에 댓글을 추가하거나 라벨을 변경할 때
+- 다른 스킬 없이 GitHub 작업만 단독으로 처리할 때
+
+---
+
+### `/pro-ssh`
+
+**무엇을 하나요?**
+AWS EC2, 시놀로지 NAS, 일반 Linux 서버 등 **SSH 접근 가능한 모든 서버에 접속**해서 명령을 실행하고 결과를 보고합니다. 비밀번호 인증과 PEM 키 인증을 모두 지원하며, 서버 정보는 `~/.projectops/config/ssh.config.json`에 저장해두면 이름만 말해도 바로 접속합니다.
+
+**수정되는 것**: 없음 (원격 서버에서 명령 실행 후 결과만 반환)
+**돌려주는 것**: SSH 명령 실행 결과 + 요약 보고
+
+**언제 쓰나요?**
+- "서버 로그 봐줘", "prod 검수해줘", "배포 됐는지 확인해줘"
+- CI/CD 완료 후 서버 상태 자동 검수
+- 여러 서버를 config에 등록해두고 이름으로 선택
+
+---
+
+## 📝 문서/산출물 생성형 Skill (4종)
+
+코드는 건드리지 않고, 특정 형식의 **문서 파일**을 생성합니다.
+
+### `/pro-report`
+
+**무엇을 하나요?**
+`git status`로 변경 파일을 확인하고, 이슈 기반으로 관련 파일을 선별해서 읽은 뒤 **구현 보고서**를 작성합니다. `.report/YYYYMMDD_#이슈번호_설명.md` 형식으로 저장됩니다.
+
+**수정되는 것**: `.report/` 폴더에 새 `.md` 파일
+**돌려주는 것**: 개요/변경사항/주요 구현 내용/주의사항이 정리된 보고서
+
+**언제 쓰나요?**
+- 구현 완료 후 PR 설명이나 내부 보고서가 필요할 때
+- 특정 이슈에 대한 작업 내역 정리
+
+---
+
+### `/pro-testcase`
+
+**무엇을 하나요?**
+GitHub 이슈를 읽고 관련 코드를 탐색한 뒤, **QA용 테스트 체크리스트**를 생성합니다. 기본 기능/엣지 케이스/프로젝트 타입별 추가 항목이 포함됩니다. 결과는 `testcase-[번호]-[설명].md`로 저장되어 **GitHub 댓글에 바로 붙여넣을 수 있습니다**.
+
+**수정되는 것**: 테스트케이스 `.md` 파일
+**돌려주는 것**: 체크박스 형식의 QA 테스트 항목 목록
+
+**언제 쓰나요?**
+- QA에게 넘기기 전 체크리스트가 필요할 때
+- 수동 테스트 시나리오를 정리하고 싶을 때
+
+---
+
+### `/pro-agent-test`
+
+**무엇을 하나요?**
+앱·웹·서버를 **실제로 실행해 밟으며 버그를 찾는 QA**입니다. 화면을 누르고(앱·웹) 요청을 보내며(서버),
+단계마다 기기 저장소·브라우저 상태·서버 DB를 대조합니다. 요청받은 자리만 보지 않고 같은 성격의
+다른 화면·대칭 동작(가입↔탈퇴, 생성↔삭제)도 함께 확인해 일관성 결함을 찾습니다.
+로그가 없으면 그것을 추적 불가 결함으로 보고합니다.
+
+**수정되는 것**: 없음 (코드를 고치지 않고 결함만 보고)
+**돌려주는 것**: 단계별 근거(스크린샷·대조표) · 재현 절차 · 심각도별 결함 목록
+
+**언제 쓰나요?**
+- 배포 전 주요 흐름(로그인·가입·결제)이 진짜 되는지 확인
+- 사용자가 겪은 버그 재현 — 유닛 테스트로 안 잡히는 것들
+- 릴리스 빌드에서만 나는 문제 (R8·서명·manifest는 debug에서 재현되지 않는다)
+
+> `/pro-testcase`(QA 문서 생성)와 다릅니다 — 이 skill은 앱을 **실행**합니다.
+
+---
+
+### `/pro-skill-creator`
+
+**무엇을 하나요?**
+Skill 파일을 **생성(CREATE)·리뷰(REVIEW)·개선(IMPROVE)** 3가지 모드로 관리합니다. CREATE는 새 SKILL.md를 표준 포맷으로 작성하고, REVIEW는 기존 Skill을 `common-rules.md` 기준으로 검토해 개선점을 제안하며, IMPROVE는 리뷰 결과를 반영해 실제로 수정합니다.
+
+**수정되는 것**: `skills/{skill-name}/SKILL.md` (IMPROVE 모드 시)
+**돌려주는 것**: 새 SKILL.md 초안 / 리뷰 리포트 / 개선된 SKILL.md
+
+**언제 쓰나요?**
+- 새 Skill을 표준에 맞게 처음부터 만들고 싶을 때
+- 기존 Skill이 최신 컨벤션과 맞는지 검토할 때
+- 리뷰 결과를 바로 Skill에 반영하고 싶을 때
+
+---
+
+## 나에게 맞추기 (Make it yours)
+
+Skill이 내 스타일로 씁니다. 선호는 `~/.projectops/config/config.json`에 적습니다. 첫 실행 때 묻지 않으며, 비어 있으면 각 Skill의 기본 동작입니다.
+
+```json
+{
+  "preferences": { "language": "ko", "tone": "짧고 단정하게", "rules": ["이모지 금지"] },
+  "skills": { "pro-commit": { "preset": "gitmoji" } }
+}
+```
+
+- 적용 순서(뒤가 이김): `preferences` → `skills.<skill-id>` → `github.repos[].preferences` → `github.repos[].skills.<skill-id>`.
+- `/pro-commit`의 형식 우선순위: 팀 `version.yml`의 `issue_helper.commit_template` → projectops가 설치된 레포의 projectops 형식 → 내 `template` → 내 `preset`(기본 `conventional`, 그 외 `projectops`·`gitmoji`·`custom`).
+- 선호는 표현만 바꿉니다. 승인 게이트, 시크릿 보호, `--dry-run`, push 금지는 끌 수 없습니다.
+- 자세히: [`skills/references/preferences.md`](https://github.com/Cassiiopeia/projectops/blob/main/skills/references/preferences.md)
+
+---
+
+## Extras (선택 플러그인)
+
+`/pro-synology-expose`(시놀로지 NAS 서비스를 외부 도메인으로 노출하는 가이드), `/pro-skill-bug`(스킬 버그 보고), `/pro-disk-cleanup`(디스크 용량 정리), `/pro-remote-link`(Orca·Paseo를 밖에서 여는 링크), `/pro-project-blueprint`(평소 방식으로 새 프로젝트 시작), `/pro-brain`(이슈마다 팀 브레인용 지식 노트)은 코어 플러그인에 없고 선택 플러그인 `projectops-extras`에 있습니다. (`/pro-code-consult`는 코어로 옮겨졌습니다.)
+
+```bash
+# Claude Code
+claude plugin install projectops-extras@projectops-marketplace --scope user
+# Codex CLI: `codex plugin marketplace add Cassiiopeia/projectops` 후 플러그인 목록에서 projectops-extras 설치
+```
+
+Cursor·Gemini CLI·pi에는 extras 설치 경로가 없고, `npx projectops` 동기화 때 이 스킬이 제거됩니다. 계속 쓰려면 레포의 `plugins/projectops-extras/skills/<스킬 폴더>`와 `plugins/projectops-extras/skills/references/`를 둘 다 직접 복사하세요.
+
+개인 설정(언어·말투·규칙)을 읽는 `prefs_cli.py`는 코어 플러그인에 들어 있습니다. extras만 설치하면 설정을 찾지 못해 기본값으로 동작합니다. 개인 설정을 쓰려면 코어 플러그인도 함께 설치하세요.
+
+### `/pro-skill-bug`
+
+**무엇을 하나요?**
+**지금 세션에서 의심되는 projectops 스킬 버그를 보고**합니다. 세션 기록에서 명령·결과·흐름·로그·스크린샷을 모으고 개인정보를 지운 뒤 `Cassiiopeia/projectops`에 이슈를 올립니다(같은 증상의 열린 이슈가 있으면 댓글). 그다음 하던 일로 돌아갑니다. 정말 버그인지 판정하거나 원인을 찾거나 고치지는 않습니다.
+
+Claude Code에서는 extras 훅이 모든 projectops CLI를 지켜보다가 버그가 의심되면 이 스킬을 백그라운드 서브에이전트로 알아서 시작합니다. 명령이 실패한 뒤 손으로 우회한 경우, 도구가 그런 기능이 없다고 답한 경우, 같은 사용법 오류 2회, 같은 실패 3회, projectops 파일 안의 예외가 기준입니다. 세션당 최대 3건입니다. 자동 보고를 끄려면 `~/.projectops/config/config.json`에 `"skill-bug": {"auto_report": false}`를 넣으세요.
+
+**수정되는 것**: 로컬에는 없음 (`Cassiiopeia/projectops`에 이슈나 댓글 생성)
+**돌려주는 것**: 이슈 링크와 새 이슈/댓글 여부 한 줄
+
+**언제 쓰나요?**
+- `pro-*` 도구의 결과가 실제로 일어난 일과 다를 때
+- 같은 명령을 계속 반복하거나, 스킬을 우회해서 끝내야 했을 때
+- "이거 버그 아냐?" — 확실하지 않아도 부르세요
+
+---
+
+### `/pro-disk-cleanup`
+
+**무엇을 하나요?**
+macOS·Windows·Linux에서 스택과 상관없이 **되찾을 수 있는 디스크 공간을 찾아 안전하게 정리**합니다. 읽기 전용 `scan`부터 하고, 찾은 것을 세 단계로 나눕니다.
+
+| 단계 | 들어가는 것 | 정리 방식 |
+|---|---|---|
+| safe | worktree 안 빌드 결과물, 브라우저 캐시, 도구 자체 정리(npm·pip·Homebrew 등) | 한 번 확인 후 |
+| decide | 열린 이슈의 worktree, 에뮬레이터 이미지, DerivedData, Gradle 캐시, 휴지통, 정체를 모르는 큰 폴더 | 사용자가 이름을 댄 것만 |
+| keep | 로그인 프로필, `.git`, 브랜치, stash, 이력 | 지우지 않음 |
+
+지우는 명령은 모두 `--yes`가 없으면 계획만 보여 줍니다. worktree는 GitHub에서 이슈가 닫혔는지 확인하고, 사용 중이거나 최근에 건드린 것이 아닌지 보고, 백업(패치와 작은 고유 파일)을 만든 뒤에만 제거하며 브랜치는 남깁니다.
+
+**수정되는 것**: 사용자가 확인한 것(safe)이나 이름을 댄 것(decide)만
+**돌려주는 것**: 정리 전후 여유 공간, 지운 것, 남긴 것과 이유, 백업 위치
+
+**언제 쓰나요?**
+- "디스크 꽉 찼어", "용량 정리해줘", "뭐가 용량 먹는지 봐줘"
+- "끝난 worktree 정리해줘", "build 폴더 지워줘"
+
+---
+
+### `/pro-remote-link`
+
+**무엇을 하나요?**
+"orca 링크 줘", "paseo 링크 줘"에 **어디서나 열 수 있는 링크 하나로 답합니다**. 앱마다 연결 방식이 다릅니다.
+- **Orca (터널)**: Orca Web용으로 떠 있는 cloudflared 빠른 터널을 재사용하거나 새로 열고, 저장해 둔 Orca 짝 맞추기 링크의 주소를 터널 주소로 바꿔 돌려줍니다. Cloudflare 계정은 필요 없고 `cloudflared`만 설치돼 있으면 됩니다.
+- **Paseo (릴레이)**: 터널 없이 Paseo CLI(`paseo daemon pair`)로 매번 새 `https://app.paseo.sh/#offer=...` 링크를 만듭니다. 릴레이가 꺼져 있으면 켜기 전에 사용자에게 묻고, 데몬 비밀번호가 없으면 경고와 설정 명령을 함께 알려 줍니다. 데몬 재시작·접속 주소 변경·웹 UI 켜기는 하지 않습니다.
+
+앱 고유 사실(포트·CLI 위치·링크 모양)은 앱별 하네스 파일에 두고 앱이 바뀌면 에이전트가 고칩니다. `apps` 명령이 지원 앱과 지금 실행·접속 가능 여부를 보여 줍니다. 새 앱은 하네스 하나와 작은 어댑터 하나로 추가합니다. macOS·Windows·Linux에서 동작합니다.
+
+**수정되는 것**: 빠른 터널 시작·중지, Orca 짝 맞추기 링크를 `~/.projectops/remote-link/` 아래 본인만 읽는 파일에 저장
+**돌려주는 것**: 링크 하나 (기기에 들어오는 열쇠라서 채팅에서 사용자에게만 보냄)
+
+**언제 쓰나요?**
+- "orca 주소 줘", "paseo 링크 줘", "밖에서 Orca/Paseo 열고 싶어"
+- 컴퓨터에서 떨어져 있을 때 브라우저로 Orca·Paseo 데스크톱을 쓰고 싶을 때
+
+---
+
+### `/pro-project-blueprint`
+
+**무엇을 하나요?**
+**주인이 프로젝트를 시작하고 운영하는 방식을 담은 표준**이라, 새 레포를 다시 설명하지 않고 같은 방식으로 세웁니다: 모노레포 구조(스택 폴더, `brand/`, `docs/superpowers/specs/`, 스택별 파일로 안내하는 루트 `CLAUDE.md`, `version.yml`), 3단 브랜치(이슈 브랜치 > `develop` > `main` > `deploy`, 승격은 PR 머지), 공개 레포의 시크릿(워크플로 시크릿은 값 하나씩, 실행용 시크릿은 플랫폼마다 파일 통째로 `APPLICATION_PROD_YML`·`ENV_FILE`, 서버에 읽기 전용으로 기록하고 NAS에 백업), NAS 배포(Docker Hub sha 태그, Traefik Blue-Green, 역방향 프록시, 공용 PostgreSQL). 프로젝트마다 반복되는 인프라 값은 개인 설정 `~/.projectops/config/config.json`의 `project-blueprint` 섹션에 두고, 스킬에는 자리표시자 예시만 들어 있습니다.
+
+**수정되는 것**: 직접 바꾸지 않음. 답을 정해 `pro-github`, `npx projectops`, `pro-synology-expose`, `pro-ssh`에 넘김
+**돌려주는 것**: 이 프로젝트에 맞춰 채운 준비 점검표
+
+**언제 쓰나요?**
+- "새 프로젝트 시작하자", "이 레포 내 다른 레포처럼 세팅해줘"
+- "새 시크릿 키는 어디에 넣어?", "배포 브랜치를 main에서 분리해줘"
+
+---
+
+### `/pro-brain`
+
+**무엇을 하나요?**
+**이후에도 유효한 프로젝트 지식**(무엇을 정했고 왜 그랬는지, 다음 사람이 걸려 넘어질 곳)을 레포 지식 폴더에 짧은 노트로 남기고 작업과 같이 커밋합니다. 그 폴더를 동기화하는 브레인(팀·개인)이 알아서 가져갑니다. 코드는 무엇을 했는지 보여 주고, 노트는 왜와 어디를 남깁니다. 레포의 `version.yml`(`metadata.template.options.knowledge`)이 켜져 있을 때만 동작하므로 레포를 받은 팀원 누구나 같은 동작을 봅니다. 브레인은 동의를 받았을 때만 바꿉니다(내 로컬 GBrain에 소스 하나 추가, 팀 브레인 MCP 항목 하나 등록). 팀 브레인 토큰은 내 컴퓨터의 자격 증명 저장소(`~/.projectops/config/config.json`)에만 이름으로 두고, 레포·노트·`version.yml`·대화에는 넣지 않습니다.
+
+**어떻게 동작하나요? (프로젝트 주인용)**
+- 처음 한 번만 질문을 최대 세 개 합니다. 모두 권장 답이 있어서 "네"만 눌러도 됩니다. **언제** 노트를 남길지(이슈가 끝날 때, 작업을 마칠 때, 머지할 때, 요청할 때만 중 레포 기록을 보고 추천), 그리고 **프로젝트 CLAUDE.md에 지식 저장 규칙을 추가해도 되는지**(모든 에이전트에게 언제 남길지와, "왜" 질문에는 팀 브레인부터 찾으라고 알려 줌)입니다. 거절하면 기억하고 다시 묻지 않습니다. CLAUDE.md가 gitignore돼 있으면 커밋되는 `.claude/rules/pro-brain.md`를 대신 권하거나, 이 컴퓨터의 새 worktree에 CLAUDE.md를 복사하도록 등록합니다.
+- 세 번째 질문은 **이 레포의 지식을 어떻게 쓰고 있는지**입니다: 레포만(기본), 내 로컬 GBrain(지식 폴더를 소스 `<project>-knowledge` 하나로 추가하고 동기화, 이름이 겹치면 멈춤), 내 원격 GBrain(그 서버에서 돌릴 명령 안내), 팀 브레인 서버(이름·주소·토큰 담당자를 `version.yml`에 저장하기 전에 주소가 진짜 브레인인지 확인해 오타를 잡음, 팀원은 자기 읽기 전용 토큰을 터미널에서 한 번 저장하고 `connect --team`에 동의하면 등록 끝, 토큰이 바뀌면 `--rotate`), GBrain 설치 안내(질문 하나로 로컬·기존 Postgres·Supabase·원격·팀 서버 중 고르고 정확한 명령과 확인 방법 안내). 개인과 팀을 함께 고를 수 있고, 설정을 다시 돌리면 지금 상태를 보고 바꿀 수 있습니다.
+- 그다음부터는 에이전트가 알맞은 때에 노트를 남기고, 사소한 작업은 한 줄 이유와 함께 건너뜁니다. 노트는 main 브랜치에 머지된 뒤 팀 브레인으로 들어갑니다. 별도 서비스도, CI의 AI 비용도 없습니다.
+- 노트에는 검색되는 제목, 바뀌지 않는 id, 태그, 관련 노트 링크, 자동으로 모은 사실(버전, 커밋 범위, 파일, API 주소, 마이그레이션, 설정·비밀값의 **이름**만, 값은 절대 없음)과 30~80줄 글(배경, 결정과 이유와 버린 대안, 동작 변화, 코드 위치, 주의점, 확인 방법)이 들어갑니다. 코드 덤프나 로그는 넣지 않습니다.
+- `gaps`는 main에 머지됐는데 노트가 없는 작업을 git 기록만으로 찾아 줍니다. 브레인 동기화 작업이 비용 없이 기록할 수 있습니다.
+
+**수정되는 것**: 지식 폴더의 노트(레포 자체 볼트 규칙이 요구하는 파일 포함), 처음 한 번 동의를 받은 뒤 `version.yml` 스위치와 표시된 규칙 블록 하나
+**돌려주는 것**: 노트 경로와 이 컴퓨터에서 알려진 동기화 대상, 또는 건너뛴 이유
+
+**언제 쓰나요?**
+- 레포 모드에 따라 `pro-report` 직후(이슈 방식), 기능 커밋 뒤나 작업을 마칠 때, 머지 뒤
+- "이 결정 팀 브레인에 남겨줘", "지식 노트 써줘", "pro-brain 설정해줘", "이 레포 내 GBrain에 연결해줘", "노트 없는 머지 작업 뭐 있어?"
+
+
+---
+
+### `/pro-synology-expose`
+
+**무엇을 하나요?**
+시놀로지 NAS에서 (Docker 등으로) 도는 **웹 서비스를 내 도메인의 HTTPS 주소로 노출하는 과정을 안내**합니다. 순서는 고정입니다: DNS 레코드(Cloudflare·Route53 등) → DSM 역방향 프록시 규칙 2개(443 → 로컬 포트, 80 → 443, 필요하면 WebSocket 헤더) → Let's Encrypt 인증서. 서비스 이름·서브도메인·포트·WebSocket 사용 여부는 사용자가 준 정보에서 추론하고 빠진 것만 묻습니다.
+
+**수정되는 것**: NAS는 직접 바꾸지 않음 (안내만 함), NAS 정보는 `~/.projectops/config/config.json`에 저장
+**돌려주는 것**: 서비스에 맞춘 단계별 설정값과 최종 점검표
+
+**언제 쓰나요?**
+- "이 서비스 서브도메인으로 붙여줘", "역방향 프록시 추가해줘", "HTTPS 설정해줘"
+- NAS에 새로 띄운 Docker 서비스에 외부 주소가 필요할 때
+
+---
+
+## 어떤 Skill을 언제 쓸까?
+
+실제 작업 순서는 **이슈 등록 → 작업 환경 분리 → 계획 → 구현 → 테스트 → 리뷰 → 보고서** 입니다.
+
+### 표준 개발 흐름 (전체 사이클)
+
+```mermaid
+flowchart TD
+    A(["작업 시작"]) --> B["/pro-github<br/>이슈 등록"]
+    B --> C["/pro-init-worktree<br/>worktree + 민감파일 복사"]
+    C --> D{"작업 유형?"}
+
+    D -->|새 기능·설계·리팩토링| E1["superpowers:brainstorming<br/>무엇을 왜 만들지 확정"]
+    D -->|버그·장애| E2["superpowers:systematic-debugging<br/>원인 조사"]
+
+    E1 --> F1["superpowers:writing-plans<br/>구현 계획 수립"]
+    F1 --> G1["superpowers:executing-plans<br/>계획 실행"]
+    E2 --> G1
+
+    G1 --> H["/pro-review<br/>셀프 리뷰"]
+    H --> I["/pro-commit<br/>이슈 연동 커밋"]
+    I --> J["/pro-report<br/>구현 보고서 + GitHub 댓글"]
+    J --> J2["/pro-brain<br/>지식 노트 (레포가 켜 둔 경우)"]
+    J2 --> K(["PR 등록"])
+    K --> L["/pro-changelog-deploy<br/>릴리스 PR + automerge"]
+```
+
+
+### 시나리오별 흐름 정리
+
+| 상황 | 추천 흐름 |
+|------|----------|
+| **새 기능 개발 (표준)** | `pro-github` → `pro-init-worktree` → `brainstorming` → `writing-plans` → `executing-plans` → `pro-review` → `pro-commit` → `pro-report` → `pro-brain`(켜진 경우) → `pro-changelog-deploy` |
+| **버그 수정** | `pro-github` → `pro-init-worktree` → `systematic-debugging`(원인 조사) → `executing-plans` → `pro-commit` → `pro-report` → `pro-brain`(켜진 경우) → `pro-changelog-deploy` |
+| **리팩토링·설계 변경** | 새 기능 개발과 동일 (`brainstorming`에서 범위를 좁혀 시작) |
+| **QA 테스트케이스** | `pro-github` → `pro-testcase` |
+| **실제 실행 검증(앱·웹·서버)** | `pro-agent-test` → (문제 발견 시) `pro-github` → `pro-commit` |
+
+### 단건 작업 (사이클 없이 단독 호출)
+
+| 상황 | 사용 Skill |
+|------|----------|
+| 코드 리뷰만 필요 | `pro-review` |
+| 이슈·PR 생성·조회·닫기, 댓글, 라벨, Actions 로그, Secret | `pro-github` |
+| 브랜치명의 이슈로 메시지를 만들어 커밋 | `pro-commit` |
+| 배포 PR 생성 + automerge, 실패한 automerge 재트리거 | `pro-changelog-deploy` |
+| PR 설명 / 구현 보고서 생성 | `pro-report` |
+| QA 체크리스트 작성 (문서만) | `pro-testcase` |
+| 앱·웹·서버를 실제로 실행해 버그 찾기 | `pro-agent-test` |
+| 앱·에뮬레이터·브라우저·서버 띄우기·조작·캡처 | `pro-launch` |
+| 설치 마법사·OS 대화상자·데스크톱 앱 조작 | `pro-desktop-control` |
+| worktree 생성 + 필요한 로컬 파일 복사 | `pro-init-worktree` |
+| 원격 서버 SSH 접속·명령 실행 | `pro-ssh` |
+| Figma 디자인을 코드로 옮기고 시안과 대조 | `pro-figma` |
+| UI 시안을 띄워 비교·선택, 디자인 요청 | `pro-ui-design` |
+| 프로젝트 화풍에 맞는 이미지 에셋 생성 | `pro-image` |
+| 발표 덱 만들기·말하기 연습 | `pro-presentation` |
+| AI가 짠 코드를 코딩 규칙 기준으로 점검·리팩터링 | `pro-code-consult` |
+| 레포를 오픈소스 프로젝트로 진단 | `pro-oss-consult` |
+| Skill 생성/리뷰/개선 | `pro-skill-creator` |
+
+---
+
+## 참고
+
+- Skill 원본: 이 레포의 `skills/` 폴더 (Claude/Gemini/Codex/Cursor 공통 원본)
+- Claude Code 매니페스트: `.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json`
+- Gemini CLI 매니페스트: `gemini-extension.json`, `GEMINI.md`
+- Codex CLI marketplace/bootstrap/metadata: `.agents/plugins/marketplace.json`, `AGENTS.md`, `.codex-plugin/plugin.json`
+- 버전 동기화: `version.yml` 변경 시 `PROJECT-TEMPLATE-PLUGIN-VERSION-SYNC` 워크플로우가 자동 반영

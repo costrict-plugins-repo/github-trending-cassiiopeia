@@ -1,0 +1,53 @@
+# Interactive wizard recording: full npx projectops install on a sample Spring project (record_cli.sh fills {{...}})
+# All 11 questions use defaults: install scope > kind > deploy > PR comments > development branch > create develop > push > Secret backup > confirm > env values > skills
+# Wait for ◆ on the first question only, then Enter every 2.5s (measured question gap under 2s)
+# Wait+Screen reads only the top lines once the screen scrolls and misses ◆ (vhs 0.12) > use a fixed interval
+
+Output "{{OUTPUT_DIR}}/cli-wizard{{SUFFIX}}.gif"
+Require node
+
+Set Shell bash
+Set Width 1200
+Set Height 820
+Set Padding 20
+{{FONT_FAMILY_LINE}}
+Set FontSize 14
+Set Theme "Catppuccin Mocha"
+Set TypingSpeed 60ms
+Set WaitTimeout 120s
+
+Hide
+Type `cd {{WORK_DIR}}/wizard/demo-app && export PROJECTOPS_LANG={{LANG}} PS1='$ ' && npx() { shift; node {{RUNNER}} {{WORK_DIR}}/template "$@"; } && clear`
+Enter
+Sleep 500ms
+Show
+
+Type "npx projectops"
+Sleep 400ms
+Enter
+
+Wait+Screen /◆/
+Sleep 1.5s
+Enter
+Sleep 2.5s
+Enter
+Sleep 2.5s
+Enter
+Sleep 2.5s
+Enter
+Sleep 2.5s
+Enter
+Sleep 2.5s
+Enter
+Sleep 2.5s
+Enter
+Sleep 2.5s
+Enter
+Sleep 2.5s
+Enter
+Sleep 2.5s
+Enter
+Sleep 2.5s
+Enter
+
+Sleep 8s

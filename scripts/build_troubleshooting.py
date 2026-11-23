@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""Build the official troubleshooting outputs: validate entries > troubleshooting/index.json + references/troubleshooting.md (#889).
+
+    python3 scripts/build_troubleshooting.py skills/pro-launch           # build
+    python3 scripts/build_troubleshooting.py skills/pro-launch --check   # check freshness only, no writes (exit 1 if stale)
+
+The entry files (troubleshooting/<area>/<id>.json) are the only source. Never hand-edit the two outputs.
+Output: one JSON line (ok/code/summary/next). Other skills pass their own folder to the same script.
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from common import troubleshoot  # noqa: E402
+from common.emit import emit  # noqa: E402
+
+DOC_PATH = Path("references") / "troubleshooting.md"
+AREA_TITLES = {"web": "Web", "android": "Android", "ios": "iOS", "server": "Server",
+               "ssh": "SSH", "general": "General"}
+
+
+def _cell(text: str) -> str:
+    return str(text).replace("|", "\\|").replace("\n", " ")
+
+
+def _render_entry(entry: dict) -> list[str]:
+    match = entry["match"]
+    lines = [f"### `{entry['id']}` — {entry['title']}", ""]
+    if match.get("codes"):
+        lines.append("- Codes: " + " · ".join(f"`{c}`" for c in match["codes"]))
+    if match.get("keywords"):
+        lines.append("- Keywords: " + ", ".join(match["keywords"]))
+    if entry.get("applies_to"):
+        applies = entry["applies_to"]
+        lines.append("- Applies to: " + (", ".join(applies) if isinstance(applies, list) else applies))
+    lines += [f"- Symptom: {entry['symptom']}", f"- Cause: {entry['cause']}", "- Fix:"]
+    lines += [f"  {n}. {f}" for n, f in enumerate(entry["fix"], 1)]
+    refs = ", ".join(f"#{r}" for r in entry["refs"]) or "—"
+    lines.append(f"- Refs: {refs} · verified {entry['verified_at']}")
+    if entry.get("see_also"):
+        lines.append("- See also: " + ", ".join(f"`{s}`" for s in entry["see_also"]))
+    return lines + [""]
+
+
+def _area_heading(area: str) -> str:
+    return f"{AREA_TITLES.get(area, area)} (`{area}`)"
+
+
+def _heading_anchor(heading: str) -> str:
+    """Title > GitHub anchor (lowercase, alphanumerics/spaces/hyphens only, space > hyphen)"""
+    kept = "".join(ch for ch in heading.lower() if ch.isalnum() or ch in " -")
+    return kept.replace(" ", "-")
+
+
+def _render_contents(entries: list[dict]) -> list[str]:
+    """Area index: link per area + entry count"""
+    lines = ["## Contents", ""]
+    for area in troubleshoot.AREAS:
+        count = sum(1 for e in entries if e["area"] == area)
+        if count:
+            heading = _area_heading(area)
+            lines.append(f"- [{heading}](#{_heading_anchor(heading)}) — {count} entries")
+    return lines + [""]
+
+
+def render_markdown(skill_dir: Path) -> str:
+    """Entries > human-readable doc (table per area + entry details)."""
+    rows, _ = troubleshoot.read_entries(skill_dir)
+    entries = sorted((e for _, e in rows if not troubleshoot.validate_entry(e)),
+                     key=lambda e: (troubleshoot.AREAS.index(e["area"]), e["id"]))
+    lines = ["# Official troubleshooting", "",
+             "> Generated file — do not edit by hand. Source: `troubleshooting/<area>/<id>.json`.",
+             "> Rebuild: `python3 scripts/build_troubleshooting.py skills/<skill>` (from the repo root).",
+             "> Writing rules: `../../references/memory-principles.md` §6. The `known_fix` in failure responses summarizes these entries.", ""]
+    if not entries:
+        return "\n".join(lines + ["No entries yet.", ""])
+    lines += _render_contents(entries)
+    for area in troubleshoot.AREAS:
+        in_area = [e for e in entries if e["area"] == area]
+        if not in_area:
+            continue
+        lines += [f"## {_area_heading(area)}", "",
+                  "| id | Title | Codes |", "|---|---|---|"]
+        lines += [f"| `{e['id']}` | {_cell(e['title'])} | "
+                  f"{' · '.join(f'`{c}`' for c in e['match'].get('codes', [])) or '—'} |" for e in in_area]
+        lines.append("")
+        for e in in_area:
+            lines += _render_entry(e)
+    return "\n".join(lines).rstrip("\n") + "\n"
+
+
+def expected_outputs(skill_dir: Path) -> dict[Path, str]:
+    """Output path > content."""
+    return {troubleshoot.index_path(skill_dir): troubleshoot.render_index(troubleshoot.build_index(skill_dir)),
+            skill_dir / DOC_PATH: render_markdown(skill_dir)}
+
+
+def _read(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def run(skill_dir: Path, is_check_only: bool) -> int:
+    # Validate input (folder, entry schema)
+    if not troubleshoot.troubleshooting_dir(skill_dir).is_dir():
+        return emit({"ok": False, "code": "no_troubleshooting_dir",
+                     "error": f"{troubleshoot.troubleshooting_dir(skill_dir)} does not exist",
+                     "next": "Create troubleshooting/<area>/<id>.json entries first"})
+    problems = troubleshoot.validate_entries(skill_dir)
+    if problems:
+        return emit({"ok": False, "code": "invalid_entries", "problems": problems,
+                     "summary": f"{len(problems)} entry problems", "next": "Fix the entries and run again"})
+    # Compare outputs > check only or write
+    outputs = expected_outputs(skill_dir)
+    stale = [path for path, text in outputs.items() if _read(path) != text]
+    relative = [path.relative_to(skill_dir).as_posix() for path in stale]
+    count = len(troubleshoot.entry_files(skill_dir))
+    if is_check_only:
+        if stale:
+            return emit({"ok": False, "code": "stale", "stale": relative,
+                         "error": "Generated files differ from the entries (edited by hand or not regenerated)",
+                         "next": f"python3 scripts/build_troubleshooting.py {skill_dir}"})
+        return emit({"ok": True, "code": "ok", "entries": count, "summary": f"Up to date ({count} entries)"})
+    for path in stale:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(outputs[path], encoding="utf-8")
+    return emit({"ok": True, "code": "ok", "entries": count, "written": relative,
+                 "summary": f"{count} entries, {len(relative)} files rewritten"})
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="build_troubleshooting", description="Build the official troubleshooting outputs: validate entries > troubleshooting/index.json + references/troubleshooting.md")
+    parser.add_argument("skill_dir", help="skill folder (e.g. skills/pro-launch)")
+    parser.add_argument("--check", action="store_true", help="only check that outputs are up to date, without writing")
+    args = parser.parse_args(argv)
+    return run(Path(args.skill_dir).resolve(), args.check)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

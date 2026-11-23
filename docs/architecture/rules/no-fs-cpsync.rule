@@ -1,0 +1,5 @@
+# No fs.cpSync: on Windows with Node 22+, a non-ASCII (e.g. Korean) path kills the process silently. Node 20 CI does not show it
+description=No fs.cpSync (crashes on Windows non-ASCII paths) — use copyPathSync in src/core/fsutil.js
+paths=src/,bin/
+extensions=.js
+pattern=\bcpSync\b(?! 는)

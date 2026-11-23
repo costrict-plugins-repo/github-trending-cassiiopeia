@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""Shared stable entry point for projectops skill CLIs: finds the newest installed script and passes arguments through (#942).
+
+    python3 ~/.projectops/bin/projectops_cli.py <skill> <subcommand> [args...]
+    e.g. projectops_cli.py github get-issue o r 12  /  commit commit --message-file m.txt
+
+This file itself is copied to `~/.projectops/bin/projectops_cli.py` — it uses only the standard library and imports
+no other module. The copy does not know where it came from, so it searches. Every skill uses the same lookup
+rules as pro-launch's stable entry point (`launch_cli.py`).
+
+Lookup order: PROJECTOPS_SKILLS_ROOT (explicit) > the current folder if it is a checkout > highest version in the plugin cache
+> unversioned install.
+"""
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+# Stable entry point content revision: overwrite only when higher than the installed one (+1 when this file or SKILL_CLIS changes, otherwise new skills get bad_args)
+RESOLVER_REVISION = 8
+STABLE_ENTRYPOINT_NAME = "projectops_cli.py"
+STABLE_ENTRYPOINT_MODE = 0o755
+SKILLS_ROOT_ENV = "PROJECTOPS_SKILLS_ROOT"
+CLAUDE_CONFIG_DIR_ENV = "CLAUDE_CONFIG_DIR"
+# On Windows, python3 may be the Microsoft Store stub
+STABLE_ENTRYPOINT_COMMAND = f"{'python' if sys.platform == 'win32' else 'python3'} ~/.projectops/bin/projectops_cli.py <skill>"
+
+# Skill name > (skill folder, CLI file)
+SKILL_CLIS = {
+    "github": ("pro-github", "github_cli.py"),
+    "commit": ("pro-commit", "commit_cli.py"),
+    "report": ("pro-report", "report_cli.py"),
+    "review": ("pro-review", "review_cli.py"),
+    "testcase": ("pro-testcase", "testcase_cli.py"),
+    "changelog-deploy": ("pro-changelog-deploy", "changelog_cli.py"),
+    "init-worktree": ("pro-init-worktree", "worktree_cli.py"),
+    "figma": ("pro-figma", "figma_cli.py"),
+    "agent-test": ("pro-agent-test", "e2e_cli.py"),
+    "ui-design": ("pro-ui-design", "ui_design_cli.py"),
+    "presentation": ("pro-presentation", "presentation_cli.py"),
+    "oss-consult": ("pro-oss-consult", "oss_cli.py"),
+    "launch": ("pro-launch", "launch_cli.py"),
+    "image": ("pro-image", "image_cli.py"),
+    "code-consult": ("pro-code-consult", "arch_cli.py"),
+}
+
+_VERSIONED_CACHE_GLOBS = (".claude*/plugins/cache", ".codex/plugins/cache")
+_UNVERSIONED_BASES = (".cursor/skills", ".copilot/skills", ".gemini/extensions", ".pi/agent/git")
+_UNVERSIONED_WALK_MAX_DEPTH = 6
+_SEMVER_PATTERN = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)")
+_REVISION_PATTERN = re.compile(r"^RESOLVER_REVISION = (\d+)", re.MULTILINE)
+
+
+def normalize_skill_name(name: str) -> str:
+    """'pro-github' > 'github'"""
+    return name[4:] if name.startswith("pro-") else name
+
+
+def is_scripts_dir(path: Path, skill: str) -> bool:
+    folder, cli_file = SKILL_CLIS[skill]
+    return path.name == "scripts" and path.parent.name == folder and (path / cli_file).is_file()
+
+
+def parse_version(text: str):
+    match = _SEMVER_PATTERN.match(text)
+    return tuple(int(part) for part in match.groups()) if match else None
+
+
+def versioned_cache_roots(home: Path, environment: dict) -> list:
+    """Plugin cache folder candidates (CLAUDE_CONFIG_DIR > ~/.claude* > ~/.codex), each real path once"""
+    candidates = []
+    config_dir = environment.get(CLAUDE_CONFIG_DIR_ENV)
+    if config_dir:
+        candidates.append(Path(config_dir).expanduser() / "plugins" / "cache")
+    for pattern in _VERSIONED_CACHE_GLOBS:
+        candidates.extend(sorted(home.glob(pattern)))
+    roots, seen = [], set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if candidate.is_dir() and resolved not in seen:
+            seen.add(resolved)
+            roots.append(candidate)
+    return roots
+
+
+def find_versioned_scripts(skill: str, home: Path, environment: dict) -> list:
+    """Every (version, script folder) in the plugin cache"""
+    folder = SKILL_CLIS[skill][0]
+    found = []
+    for cache_root in versioned_cache_roots(home, environment):
+        for candidate in cache_root.glob(f"*/projectops/*/skills/{folder}/scripts"):
+            version = parse_version(candidate.parents[2].name)
+            if version and is_scripts_dir(candidate, skill):
+                found.append((version, candidate))
+    return found
+
+
+def find_checkout_scripts(skill: str, start: Path):
+    folder = SKILL_CLIS[skill][0]
+    for parent in (start, *start.parents):
+        candidate = parent / "skills" / folder / "scripts"
+        if is_scripts_dir(candidate, skill):
+            return candidate
+    return None
+
+
+def _walk_unversioned(base: Path, skill: str):
+    if not base.is_dir():
+        return None
+    for root, directories, _files in os.walk(base):
+        root_path = Path(root)
+        if root_path.name == "scripts" and is_scripts_dir(root_path, skill):
+            return root_path
+        depth = len(root_path.relative_to(base).parts)
+        directories[:] = [] if depth >= _UNVERSIONED_WALK_MAX_DEPTH else [
+            name for name in directories if name not in ("node_modules", ".git", "__pycache__")]
+    return None
+
+
+def readable_cwd(environment=None):
+    """Current folder path. If getcwd fails (macOS protected folder EPERM, deleted folder), re-enter $PWD and retry; None if it still fails (#1131)"""
+    try:
+        return Path.cwd()
+    except OSError:
+        pass
+    shell_folder = (os.environ if environment is None else environment).get("PWD", "")
+    if not os.path.isabs(shell_folder):
+        return None
+    try:
+        os.chdir(shell_folder)
+        return Path.cwd()
+    except OSError:
+        return None
+
+
+def resolve_scripts_dir(skill: str, cwd=None, home=None, environment=None):
+    """First script folder in lookup order (see module docstring). None if not found"""
+    environment = os.environ if environment is None else environment
+    cwd = readable_cwd(environment) if cwd is None else cwd
+    home = Path.home() if home is None else home
+    override = environment.get(SKILLS_ROOT_ENV)
+    if override:
+        candidate = Path(override).expanduser() / "skills" / SKILL_CLIS[skill][0] / "scripts"
+        return candidate if is_scripts_dir(candidate, skill) else None
+    # If the current folder is unreadable, skip only the checkout lookup
+    checkout = find_checkout_scripts(skill, cwd.resolve()) if cwd else None
+    if checkout:
+        return checkout
+    versioned = find_versioned_scripts(skill, home, environment)
+    if versioned:
+        return max(versioned, key=lambda version_and_path: version_and_path[0])[1]
+    for base in _UNVERSIONED_BASES:
+        found = _walk_unversioned(home / base, skill)
+        if found:
+            return found
+    return None
+
+
+def newer_installed_info(running_scripts_dir: Path, skill: str, home=None, environment=None):
+    """{running, installed, use} when running from an old cached version, else None (checkouts are not compared)"""
+    running_parts = running_scripts_dir.resolve().parts
+    if len(running_parts) < 5 or running_parts[-5] != "projectops":
+        return None
+    running_version = parse_version(running_parts[-4])
+    environment = os.environ if environment is None else environment
+    versions = find_versioned_scripts(skill, Path.home() if home is None else home, environment)
+    newest = max(versions)[0] if versions else None
+    if not running_version or not newest or newest <= running_version:
+        return None
+    return {"running": ".".join(map(str, running_version)), "installed": ".".join(map(str, newest)),
+            "use": f"{STABLE_ENTRYPOINT_COMMAND}"}
+
+
+def _installed_revision(entrypoint: Path) -> int:
+    try:
+        match = _REVISION_PATTERN.search(entrypoint.read_text(encoding="utf-8"))
+    except OSError:
+        return -1
+    return int(match.group(1)) if match else -1
+
+
+def refresh_stable_entrypoint(projectops_home: Path) -> bool:
+    """Sync {projectops_home}/bin/projectops_cli.py to this file. True if changed (no write when installed revision is equal or higher)"""
+    entrypoint = projectops_home / "bin" / STABLE_ENTRYPOINT_NAME
+    if _installed_revision(entrypoint) >= RESOLVER_REVISION:
+        return False
+    entrypoint.parent.mkdir(parents=True, exist_ok=True)
+    temporary = entrypoint.with_name(f"{entrypoint.name}.{os.getpid()}.tmp")
+    temporary.write_text(Path(__file__).read_text(encoding="utf-8"), encoding="utf-8")
+    os.chmod(temporary, STABLE_ENTRYPOINT_MODE)
+    os.replace(temporary, entrypoint)
+    return True
+
+
+def main(arguments: list) -> int:
+    if not arguments or normalize_skill_name(arguments[0]) not in SKILL_CLIS:
+        print('{"ok": false, "code": "bad_args", "summary": "usage: projectops_cli.py <skill> <subcommand> ...", '
+              '"available_skills": %s, "next": "pass a skill name as the first argument"}' % str(sorted(SKILL_CLIS)).replace("'", '"'))
+        return 1
+    skill = normalize_skill_name(arguments[0])
+    # Child CLIs also resolve relative paths against the current folder, so stop with JSON instead of a traceback
+    if readable_cwd() is None:
+        print('{"ok": false, "code": "cwd_unreadable", "summary": "cannot read the current folder (macOS privacy '
+              'protection or a deleted folder)", "next": "cd into the project folder again (or cd ~ and pass '
+              'absolute paths such as --root/--deck), then retry"}')
+        return 1
+    scripts_dir = resolve_scripts_dir(skill)
+    if scripts_dir is None:
+        print('{"ok": false, "code": "scripts_not_found", "summary": "no installed pro-%s scripts found", '
+              '"next": "install the projectops plugin or set %s"}' % (skill, SKILLS_ROOT_ENV))
+        return 1
+    return subprocess.call([sys.executable, str(scripts_dir / SKILL_CLIS[skill][1]), *arguments[1:]])
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,44 @@
+"""`web dialog` — set in advance how to handle the next dialog (alert, confirm, prompt) (#892).
+
+Dialogs open the moment you press, so handling them afterwards is too late. Store it in the state file and re-arm on every attach
+(`session.arm_dialog`, #625). It is cleared after one use. The outcome goes into that call's `dialog` result.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+
+from pro_launch.registry import Action
+from pro_launch.runtime.browser import write_state
+from pro_launch.runtime.output import out
+
+
+def execute(args, state: dict, state_f: Path) -> int:
+    if args.clear:
+        state.pop("dialog", None)
+        write_state(state_f, state)
+        return out({"action": "dialog", "armed": None,
+                    "summary": "Dialog handling cleared (dialogs get dismissed)"})
+    if not (args.accept or args.dismiss):
+        return out({"action": "dialog", "armed": state.get("dialog"),
+                    "summary": "Armed handling: " + (state["dialog"]["action"] if state.get("dialog") else "none (dialogs get dismissed)"),
+                    "hint": "web dialog --accept [--text <prompt input>] or --dismiss"})
+    plan = {"action": "accept" if args.accept else "dismiss"}
+    if args.accept and args.text is not None:
+        plan["text"] = args.text
+    state["dialog"] = plan
+    write_state(state_f, state)
+    return out({"action": "dialog", "armed": plan,
+                "summary": f"The next dialog will be {'accepted' if args.accept else 'dismissed'} (once)",
+                "next": "web click --ref <number>  # the action that opens the dialog. Its result carries what was done in dialog"})
+
+
+def configure(p) -> None:
+    group = p.add_mutually_exclusive_group()
+    group.add_argument("--accept", action="store_true", help="Accept (OK on confirm · prompt gets --text)")
+    group.add_argument("--dismiss", action="store_true", help="Dismiss (Cancel)")
+
+
+ACTION = Action(name="dialog", needs="state_offline", run=execute, configure=configure,
+                options=("text", "clear"),
+                help="Arm the next dialog (alert · confirm · prompt) to be accepted or dismissed (once)",
+                example='web dialog --accept --text "New name"')

@@ -1,0 +1,110 @@
+"""`devices` / `device list|bind|unbind|show` — see attached devices and bind roles to them."""
+from __future__ import annotations
+
+
+from pro_launch.runtime import host_resources
+from pro_launch.runtime.context import project_root
+from pro_launch.runtime.device_claims import owners_by_device
+from pro_launch.runtime.devices import build_info, build_mismatch, devices_path, ios_udids, list_devices, load_devices, save_devices
+from pro_launch.runtime.envfile import resolve_run_dir, write_env_sh
+from pro_launch.runtime.output import out
+
+
+def run_devices(args) -> int:
+    dev = list_devices()
+    n = len(dev["android"]) + len(dev["ios_booted"])
+    # Host memory pressure summary — shown before booting more devices (#883). Details via doctor --resources
+    resources = host_resources.memory_summary()
+    advice = host_resources.pressure_advice(resources["pressure"])
+    return out({**dev, "resources": resources, "owners": owners_by_device(),
+                "summary": f"{n} devices available · memory pressure {resources['pressure']}",
+                "next": advice or (None if n else "Boot one with device boot --device <AVD name|simulator name|UDID>")})
+
+
+def _describe_one_device(device_id: str, bindings: list[dict]) -> dict:
+    """One device: connected, platform, role, owner (#1073)"""
+    connected = list_devices()
+    is_android = device_id in connected["android"]
+    is_ios = device_id in ios_udids(connected)
+    role = next((binding.get("role") for binding in bindings if binding.get("serial") == device_id), None)
+    owner = owners_by_device().get(device_id)
+    return {"device": {"id": device_id, "found": is_android or is_ios,
+                       "platform": "android" if is_android else "ios" if is_ios else None, "role": role, "owner": owner},
+            "summary": f"{device_id}: " + ("connected" if is_android or is_ios else "not connected")
+                       + (", claimed" if owner else "")}
+
+
+def run_binding_action(args) -> int:
+    """Bind roles to devices and check what is installed (list, bind, unbind, show)."""
+    root = project_root(args)
+    known = load_devices(root)
+    bindings = known["bindings"]
+    package = args.package or known["package"]
+
+    if args.action in ("bind", "unbind"):
+        if not args.role:
+            return out({"ok": False, "code": "args_required", "error": "--role is required",
+                        "hint": "Use the same value as a key in the scenario's roles"})
+        bindings = [b for b in bindings if b["role"] != args.role]
+        if args.action == "bind":
+            if not args.serial:
+                return out({"ok": False, "code": "args_required",
+                            "error": "--serial is required",
+                            "hint": "See the attached devices with device list first"})
+            entry = {"role": args.role, "serial": args.serial}
+            if args.note:
+                entry["note"] = args.note
+            bindings.append(entry)
+        save_devices(root, package, bindings)
+        run_dir = resolve_run_dir(args)
+        env = write_env_sh(run_dir, package, bindings) if (run_dir and run_dir.is_dir()) else None
+        return out({
+            "bindings": bindings, "file": str(devices_path(root)),
+            "env_file": str(env) if env else None,
+            "summary": f"{len(bindings)} roles" + ("" if env else " (env.sh not written yet)"),
+            "next": (None if env else
+                     "Create a run folder with get-output-path first, set $RUN_DIR, "
+                     "then call again to write env.sh"),
+        })
+
+    if args.action == "show" and getattr(args, "device", None):
+        return out(_describe_one_device(args.device, bindings))
+    if args.action == "show":
+        return out({"bindings": bindings, "package": package,
+                    "file": str(devices_path(root)), "summary": f"{len(bindings)} roles"})
+
+    # list — attached devices + roles + installed builds
+    dev = list_devices()
+    by_role = {b["serial"]: b for b in bindings}
+    # Device ownership (device claim) — shows devices held by other sessions directly in the list (#925)
+    owners = owners_by_device()
+    rows = []
+    for serial in dev["android"]:
+        b = by_role.get(serial, {})
+        rows.append({"serial": serial, "role": b.get("role"), "note": b.get("note"),
+                     "owner": owners.get(serial), "build": build_info(serial, package)})
+    unbound = [r["serial"] for r in rows if not r["role"]]
+    mismatch = build_mismatch(rows)
+    ios_ids = ios_udids(dev)
+    stale = [b["serial"] for b in bindings
+             if b["serial"] not in dev["android"] and b["serial"] not in ios_ids]
+    nxt = None
+    if mismatch:
+        nxt = "Install the same build on both and check again — if only one is reinstalled, the screens you step through will differ"
+    elif stale:
+        nxt = f"Bound devices are not attached: {', '.join(stale)}"
+    elif len(rows) > 1 and unbound:
+        nxt = ("Bind roles with device bind --role {KEY} --serial {SERIAL} — "
+               "otherwise adb cannot tell which device to target")
+    # Devices may boot after get-output-path. Without refreshing the environment, DEV is empty.
+    run_dir = resolve_run_dir(args)
+    env = write_env_sh(run_dir, package, bindings) if (run_dir and run_dir.is_dir()) else None
+    return out({
+        "devices": rows, "env_file": str(env) if env else None,
+        "ios_booted": dev["ios_booted"], "owners": owners, "package": package,
+        "build_mismatch": mismatch, "stale_bindings": stale,
+        "summary": (f"{len(rows)} devices · {len(bindings)} roles"
+                    + (f" · {len(mismatch)} build mismatches" if mismatch else "")),
+        "next": nxt, "ok": not mismatch,
+        "code": "build_mismatch" if mismatch else "ok",
+    })

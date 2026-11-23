@@ -1,0 +1,25 @@
+"""`web goto` — navigate to a URL."""
+from __future__ import annotations
+
+
+from pro_launch.commands.web.session import done_payload, settle
+from pro_launch.registry import Action
+
+
+def execute(page, args, state: dict) -> dict:
+    if not args.url:
+        return {"ok": False, "code": "url_required", "error": "--url is required"}
+    resp = page.goto(args.url, wait_until="domcontentloaded", timeout=max(args.timeout, 30) * 1000)
+    nav_status = resp.status if resp is not None else None
+    settle(page, state, args.timeout)
+    payload = done_payload(args.action, page)
+    # Landing on a 404 or 500 page still counts as navigation — include the status code and let the caller decide (#711)
+    payload["status"] = nav_status
+    if nav_status is not None and nav_status >= 400:
+        payload["summary"] += f" (HTTP {nav_status} — error response)"
+        payload["http_error"] = True
+    return payload
+
+
+ACTION = Action(name="goto", run=execute, options=("url", "timeout"), positional="url",
+                help="Navigate to a URL", example="web goto http://localhost:3000/items  (same as --url)")

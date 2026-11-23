@@ -1,0 +1,320 @@
+"""`render scaffold` — create a temporary Flutter render folder (font loader · golden test skeleton · shots/) (#948)."""
+from __future__ import annotations
+
+import json
+import re
+import shlex
+import time
+from pathlib import Path
+
+from pro_launch.runtime.app_identity import find_flutter_root
+from pro_launch.runtime.context import state_home
+
+
+#
+# Rewriting the harness by hand on every run cost 80-150 tool calls (#948).
+# This command creates the whole folder and refuses if it already exists — never overwrites someone else's work.
+# The created list is kept in a manifest (state folder outside the repo) for run's cleanup and retry decisions.
+SCAFFOLD_FOLDER = "test/_launch_render"
+SCAFFOLD_MANIFEST = "render-scaffold.json"
+# Render recipe doc (pointed to by next on unsupported_stack)
+RENDER_RECIPE = "references/render.md"
+# Non-Flutter stack markers: file name > stack name
+_OTHER_STACK_MARKERS = (("package.json", "react/node"), ("build.gradle", "spring"),
+                        ("build.gradle.kts", "spring"), ("pom.xml", "maven"),
+                        ("pyproject.toml", "python"), ("requirements.txt", "python"))
+
+
+def scaffold_manifest_path(root: Path) -> Path:
+    return state_home(root) / SCAFFOLD_MANIFEST
+
+
+def read_scaffold_manifest(root: Path) -> dict | None:
+    f = scaffold_manifest_path(root)
+    if not f.is_file():
+        return None
+    try:
+        saved = json.loads(f.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return saved if saved.get("root") == str(root) else None
+
+
+def settle_scaffold_after_run(root: Path) -> dict | None:
+    """scaffold state after run cleanup: delete the manifest if the folder is gone, otherwise info for a warning"""
+    saved = read_scaffold_manifest(root)
+    if saved is None:
+        return None
+    folder = root / saved["folder"]
+    if not folder.exists():
+        scaffold_manifest_path(root).unlink(missing_ok=True)
+        return {"scaffold": "cleaned"}
+    return {"scaffold": "still_present",
+            "scaffold_warning": f"Scaffold folder is still there: {saved['folder']} — add --cleanup {saved['folder']}"}
+
+
+def _project_paths_flutter(root: Path) -> str | None:
+    """version.yml project_paths.flutter value (monorepo subfolder). None if absent"""
+    f = root / "version.yml"
+    if not f.is_file():
+        return None
+    in_paths = False
+    for line in f.read_text(encoding="utf-8", errors="ignore").splitlines():
+        if re.match(r"^project_paths:", line):
+            in_paths = True
+            continue
+        if in_paths:
+            if line and not line[:1].isspace():
+                break
+            m = re.match(r"^\s+flutter:\s*[\"']?([^\"'#\s]+)", line)
+            if m:
+                return m.group(1)
+    return None
+
+
+def _is_flutter_app(folder: Path) -> bool:
+    pub = folder / "pubspec.yaml"
+    try:
+        return pub.is_file() and "flutter:" in pub.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+
+
+def _resolve_flutter_app(root: Path, app_arg: str | None) -> Path | None:
+    """Find the Flutter app folder: --app > version.yml project_paths > pubspec.yaml search"""
+    for candidate in (app_arg, _project_paths_flutter(root)):
+        if candidate and _is_flutter_app(root / candidate):
+            return (root / candidate).resolve()
+    if app_arg:
+        return None   # if the given folder is not a Flutter app, do not pick some other app
+    found = find_flutter_root(root)
+    return found.resolve() if found else None
+
+
+def _other_stacks(root: Path) -> list[str]:
+    kinds = []
+    for marker, kind in _OTHER_STACK_MARKERS:
+        if any("node_modules" not in f.parts for f in list(root.rglob(marker))[:10]) and kind not in kinds:
+            kinds.append(kind)
+    return kinds
+
+
+def _package_name(app: Path) -> str:
+    m = re.search(r"^name:\s*([\w]+)", (app / "pubspec.yaml").read_text(encoding="utf-8", errors="ignore"), re.M)
+    return m.group(1) if m else "your_app"
+
+
+# Font loader: app FontManifest (pubspec fonts·MaterialIcons·package icons) + SDK Roboto·MaterialIcons
+# The skeleton pre-empts the trap of icons rendering as □ (render.md) (#948)
+_FONT_CONFIG_DART = """\
+// Created by `launch_cli.py render scaffold` (#948) — deleted with this folder after render run.
+// Applies only to tests in this folder: loads real fonts so text and icons are not drawn as boxes.
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:flutter/services.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+import 'render_theme.dart';
+
+Future<void> testExecutable(FutureOr<void> Function() testMain) async {
+  TestWidgetsFlutterBinding.ensureInitialized();
+  final loaded = await _loadManifestFonts();
+  await _loadSdkFonts(loaded);
+  await testMain();
+}
+
+/// Fonts the app declares (pubspec `fonts:`, MaterialIcons with uses-material-design, package icon fonts).
+Future<Set<String>> _loadManifestFonts() async {
+  final loaded = <String>{};
+  try {
+    final manifest = json.decode(await rootBundle.loadString('FontManifest.json')) as List<dynamic>;
+    for (final entry in manifest.cast<Map<String, dynamic>>()) {
+      final family = entry['family'] as String;
+      final assets = (entry['fonts'] as List<dynamic>).map((f) => (f as Map<String, dynamic>)['asset'] as String);
+      // Package fonts are looked up as 'packages/<pkg>/<family>'; also register the bare name.
+      final names = {family, family.replaceFirst(RegExp(r'^packages/[^/]+/'), '')};
+      for (final name in names) {
+        final loader = FontLoader(name);
+        for (final asset in assets) {
+          loader.addFont(rootBundle.load(asset));
+        }
+        await loader.load();
+        loaded.add(name);
+      }
+      // Text fonts become renderTheme's fallback (icon fonts never hold text glyphs).
+      final bare = family.replaceFirst(RegExp(r'^packages/[^/]+/'), '');
+      if (!bare.toLowerCase().contains('icon') && !renderTextFontFamilies.contains(bare)) {
+        renderTextFontFamilies.add(bare);
+      }
+    }
+  } catch (error) {
+    // ignore: avoid_print
+    print('[launch render] FontManifest.json not loaded: $error');
+  }
+  return loaded;
+}
+
+/// SDK copies of Roboto (default Material text on the test platform) and MaterialIcons.
+Future<void> _loadSdkFonts(Set<String> loaded) async {
+  final flutterRoot = Platform.environment['FLUTTER_ROOT'];
+  if (flutterRoot == null) return;
+  final dir = Directory('$flutterRoot/bin/cache/artifacts/material_fonts');
+  if (!dir.existsSync()) return;
+  final files = dir.listSync().whereType<File>().toList();
+  Future<void> load(String family, bool Function(String name) pick) async {
+    if (loaded.contains(family)) return;
+    final picked = files.where((f) => pick(f.uri.pathSegments.last)).toList();
+    if (picked.isEmpty) return;
+    final loader = FontLoader(family);
+    for (final file in picked) {
+      loader.addFont(file.readAsBytes().then((bytes) => ByteData.view(bytes.buffer)));
+    }
+    await loader.load();
+  }
+
+  await load('Roboto', (name) => name.startsWith('Roboto-') && name.endsWith('.ttf'));
+  await load('MaterialIcons', (name) => name.startsWith('MaterialIcons') && name.endsWith('.otf'));
+}
+"""
+
+# The test engine has no system font fallback (#1179): styles without fontFamily > test font (all □),
+# Korean glyphs missing from Roboto > □. On devices the system font fills in. renderTheme fills both from the theme
+_RENDER_THEME_DART = """\
+// Created by `launch_cli.py render scaffold` (#1179) — deleted with this folder after render run.
+// The test engine has no system font to fall back to, so text a device draws fine can come out as boxes.
+import 'package:flutter/material.dart';
+
+/// App text fonts that flutter_test_config.dart loaded (icon fonts excluded).
+final List<String> renderTextFontFamilies = <String>[];
+
+/// Wrap the app theme for render tests: renderTheme(AppTheme.light()).
+/// - A style with no fontFamily (often a button theme's textStyle) gets the theme's family.
+/// - Every style gets the app fonts as fontFamilyFallback (Korean text in Roboto-styled labels).
+ThemeData renderTheme(ThemeData theme) {
+  final family = theme.textTheme.bodyMedium?.fontFamily ?? 'Roboto';
+  final fallback = <String>{family, ...renderTextFontFamilies}.toList();
+  TextStyle? fill(TextStyle? style) => style?.copyWith(
+        fontFamily: style.fontFamily ?? family,
+        fontFamilyFallback: style.fontFamilyFallback ?? fallback,
+      );
+  ButtonStyle? fillButton(ButtonStyle? style) {
+    final textStyle = style?.textStyle;
+    if (style == null || textStyle == null) return style;
+    return style.copyWith(textStyle: WidgetStateProperty.resolveWith((states) => fill(textStyle.resolve(states))));
+  }
+
+  return theme.copyWith(
+    textTheme: theme.textTheme.apply(fontFamilyFallback: fallback),
+    primaryTextTheme: theme.primaryTextTheme.apply(fontFamilyFallback: fallback),
+    filledButtonTheme: FilledButtonThemeData(style: fillButton(theme.filledButtonTheme.style)),
+    elevatedButtonTheme: ElevatedButtonThemeData(style: fillButton(theme.elevatedButtonTheme.style)),
+    outlinedButtonTheme: OutlinedButtonThemeData(style: fillButton(theme.outlinedButtonTheme.style)),
+    textButtonTheme: TextButtonThemeData(style: fillButton(theme.textButtonTheme.style)),
+    appBarTheme: theme.appBarTheme.copyWith(
+      titleTextStyle: fill(theme.appBarTheme.titleTextStyle),
+      toolbarTextStyle: fill(theme.appBarTheme.toolbarTextStyle),
+    ),
+    snackBarTheme: theme.snackBarTheme.copyWith(contentTextStyle: fill(theme.snackBarTheme.contentTextStyle)),
+  );
+}
+"""
+
+# Golden skeleton: one-state example (icon + text). The agent replaces it with the real screen widget
+_RENDER_TEST_DART = """\
+// Created by `launch_cli.py render scaffold` (#948) — deleted with this folder after render run.
+// Replace the example with the real screen widget and fake data. One testWidgets per state.
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart'; // MethodChannel · SystemChrome — for stubbing plugin channels
+import 'package:flutter_test/flutter_test.dart';
+// import 'package:{package}/...'; // the real screen widget and its models
+
+import 'render_theme.dart';
+
+void main() {
+  Widget wrap(Widget child) => MaterialApp(
+        debugShowCheckedModeBanner: false,
+        theme: renderTheme(ThemeData()), // wrap the repo's theme: renderTheme(AppTheme.light())
+        home: Scaffold(body: child),
+      );
+
+  testWidgets('example', (tester) async {
+    // Phone-sized viewport (390x844 logical points at 3x)
+    tester.view.physicalSize = const Size(1170, 2532);
+    tester.view.devicePixelRatio = 3.0;
+    addTearDown(tester.view.reset);
+
+    await tester.pumpWidget(wrap(const Center(
+      child: Row(mainAxisSize: MainAxisSize.min, children: [
+        Icon(Icons.favorite, color: Colors.red),
+        SizedBox(width: 8),
+        Text('Replace with the real screen'),
+      ]),
+    )));
+    await tester.pumpAndSettle();
+    await expectLater(find.byType(MaterialApp), matchesGoldenFile('shots/example.png'));
+  });
+}
+"""
+
+
+def _rel(root: Path, target: Path) -> str:
+    return target.resolve().relative_to(root.resolve()).as_posix()
+
+
+def render_scaffold(root: Path, app_arg: str | None, take_baseline) -> dict:
+    """Find the Flutter app > refuse if the folder exists > take baseline > create files > record manifest"""
+    app = _resolve_flutter_app(root, app_arg)
+    if app is None:
+        others = _other_stacks(root)
+        if app_arg or not others:
+            return {"ok": False, "code": "flutter_app_not_found",
+                    "error": f"No Flutter app (pubspec.yaml with flutter:) found{' at --app ' + app_arg if app_arg else ''}",
+                    "next": "Pass --app <folder with pubspec.yaml> (relative to --root)"}
+        return {"ok": False, "code": "unsupported_stack", "detected": others,
+                "error": "render scaffold supports Flutter only",
+                "next": f"Write the temporary render code by hand following the stack's recipe in {RENDER_RECIPE}, then render run"}
+
+    folder = app / SCAFFOLD_FOLDER
+    folder_rel = _rel(root, folder)
+    if folder.exists():
+        saved = read_scaffold_manifest(root)
+        is_ours = bool(saved and saved.get("folder") == folder_rel)
+        return {"ok": False, "code": "scaffold_exists", "folder": folder_rel,
+                "created_by_scaffold": is_ours,
+                "error": f"{folder_rel} already exists — not overwritten",
+                "next": (f"A previous scaffold left it: remove it with render run --cmd true --cleanup {folder_rel}, then scaffold again"
+                         if is_ours else "Someone else's files may be there. Do not delete them; ask the user")}
+
+    # Take the baseline **before** creating temp files (render.md ① — so missed cleanup shows up as leftovers)
+    baseline = take_baseline()
+
+    shots = folder / "shots"
+    config_file = folder / "flutter_test_config.dart"
+    test_file = folder / "render_test.dart"
+    theme_file = folder / "render_theme.dart"
+    shots.mkdir(parents=True)
+    config_file.write_text(_FONT_CONFIG_DART, encoding="utf-8")
+    theme_file.write_text(_RENDER_THEME_DART, encoding="utf-8")
+    test_file.write_text(_RENDER_TEST_DART.replace("{package}", _package_name(app)), encoding="utf-8")
+    created = [folder_rel, _rel(root, shots), _rel(root, config_file), _rel(root, theme_file), _rel(root, test_file)]
+
+    manifest = scaffold_manifest_path(root)
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text(json.dumps({"root": str(root), "app": _rel(root, app) or ".", "folder": folder_rel,
+                                    "created": created, "at": time.strftime("%Y-%m-%d %H:%M:%S")},
+                                   ensure_ascii=False), encoding="utf-8")
+
+    app_rel = _rel(root, app)
+    shots_glob = f"{folder_rel}/shots/*.png"
+    run_cmd = ["render", "run", "--root", str(root)]
+    if app_rel:
+        run_cmd += ["--cwd", app_rel]
+    run_cmd += ["--cmd", f"flutter test {SCAFFOLD_FOLDER} --update-goldens",
+                "--collect", shots_glob, "--cleanup", folder_rel]
+    return {"ok": True, "app": app_rel or ".", "folder": folder_rel, "created": created,
+            "manifest": str(manifest), "baseline": baseline,
+            "summary": f"Created {folder_rel} (font loader incl. MaterialIcons, renderTheme, golden skeleton, shots/)",
+            "next": "Edit " + _rel(root, test_file) + " to render the real screen (keep the app theme inside renderTheme(...)), then: "
+                    "{PYTHON} {SCRIPTS}/launch_cli.py " + " ".join(shlex.quote(a) for a in run_cmd)}

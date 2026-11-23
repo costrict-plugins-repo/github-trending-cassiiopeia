@@ -1,0 +1,5 @@
+# pull_request_target also runs on fork PRs. Checking only the branch name lets a fork's same-named branch get auto-merged
+description=Release workflows must not decide on head.ref alone (check head.repo too)
+paths=.github/workflows/
+extensions=.yaml,.yml
+pattern=if: github\.event\.pull_request\.head\.ref == 'develop'\s*$

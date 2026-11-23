@@ -1,0 +1,5 @@
+# No unexplained catch-all ignore: put a reason comment on the same line to tell cleanup ignores from swallowed real errors
+description=No except (Exception): pass without a reason comment
+paths=scripts/,skills/,plugins/
+extensions=.py
+pattern=^[ \t]*except(?:[ \t]+(?:Exception|BaseException)(?:[ \t]+as[ \t]+\w+)?)?[ \t]*:[ \t]*\n[ \t]*pass[ \t]*$

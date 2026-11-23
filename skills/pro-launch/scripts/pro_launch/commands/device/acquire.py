@@ -1,0 +1,233 @@
+"""`device acquire` — borrow a device by criteria: decide > (revert dead session settings) > (create) > (boot) > verify inside the lock and lease (#953 · #954).
+
+--count N borrows N distinct devices with the same criteria (devices held by this session drop out of the next decision).
+With --need, first clone powered-off devices that have that state to cover the shortfall (iOS — clones are marked unconfirmed).
+"""
+from __future__ import annotations
+
+import hashlib
+import time
+
+from pro_launch.commands.device.claims import run_restore_commands
+from pro_launch.runtime import (android_device, boot_turn, device_backends, device_benchmark, device_claims, device_marks,
+                                device_pool_facts)
+from pro_launch.runtime.context import project_root
+from pro_launch.runtime.device_backends.base import default_device_name
+from pro_launch.runtime.device_boot import resolve_window
+from pro_launch.runtime.device_pool import AcquireRequest, Candidate, decide
+from pro_launch.runtime.host_resources import MEMORY_RISK_NEXT
+from pro_launch.runtime.output import out
+from pro_launch.runtime.session_identity import session_identity
+
+# Max wait (s) for one acquire --wait — within the agent tool's command time limit (default 2 min)
+ACQUIRE_WAIT_MAXIMUM_SECONDS = 90
+ACQUIRE_POLL_SECONDS = 15
+# Number of re-decisions when a chosen device is lost to contention
+CLAIM_RACE_RETRIES = 3
+# --count cap (devices borrowed at once)
+ACQUIRE_COUNT_MAXIMUM = 4
+
+
+def wait_key(request: AcquireRequest) -> str:
+    """Wait record key: session + criteria (calling again with the same criteria continues the wait time)."""
+    condition = (f"{request.platform}|{request.form}|{request.os_minimum}|{request.device}|"
+                 f"{','.join(request.needs)}|{request.is_fresh_required}")
+    return f"{session_identity()}|{hashlib.sha1(condition.encode('utf-8')).hexdigest()[:10]}"
+
+
+def _restore_dead_session_settings(key: str, dead_lease: dict) -> list[dict]:
+    """reclaim: revert settings changed by dead sessions > list of failures (failures are kept as this session's records)."""
+    settings = device_claims.pop_settings_of_session(key, dead_lease.get("session"))
+    failed = [setting for setting in settings if not run_restore_commands(setting)["is_ok"]]
+    if failed:
+        device_claims.keep_settings_for_this_session(key, failed)
+    return [{"key": setting.get("key"), "restore_commands": setting.get("restore_commands")} for setting in failed]
+
+
+def _failure(code: str, verdict: str, device: str | None, detail: str | None, reasons, next_step: str) -> dict:
+    return {"ok": False, "code": code, "verdict": verdict, "device": device, "error": detail,
+            "reasons": list(reasons), **android_device.host_pressure_fields(), "next": next_step}
+
+
+def _create_device(request: AcquireRequest, args) -> tuple[dict | None, Candidate | None]:
+    """Create a temporary device and record it in the ledger > (failure response, new powered-off candidate)."""
+    backend = next(b for b in device_backends.backends_for(request.platform) if b.capabilities.can_create)
+    name = getattr(args, "name", None) or default_device_name(time.strftime("%Y%m%d-%H%M%S"))
+    created = backend.create(name, request.form, request.os_minimum)
+    if not created["is_ok"]:
+        return _failure("create_failed", "create", None, created["detail"], [],
+                        "See existing devices with devices and widen the conditions, or check the tools (Xcode runtimes · Android SDK)"), None
+    reason = getattr(args, "reason", None) or request.purpose or "acquire: no free device matched the conditions"
+    device_marks.record_created(created["key"], reason, device_marks.temporary_ttl_days(), backend.name)
+    facts = next((f for f in backend.list_devices() if f.key == created["key"]), None)
+    if facts is None:
+        return _failure("create_failed", "create", created["key"], "The created device does not appear in the list", [],
+                        "Check with devices"), None
+    return None, Candidate(facts, backend.capabilities)
+
+
+def _take(decision, candidate: Candidate, request: AcquireRequest, args) -> tuple[dict | None, dict | None]:
+    """Boot and hold the chosen device > (failure response, result). (None, None) if another took it first."""
+    backend = device_backends.backend_named(candidate.facts.backend)
+    unrestored = (_restore_dead_session_settings(candidate.facts.key, decision.reclaimed_from)
+                  if decision.reclaimed_from else [])
+    instance, is_booted_now = candidate.facts.instance, False
+    if decision.is_boot_needed and not candidate.facts.is_booted:
+        window, scale = resolve_window(getattr(args, "window", None), getattr(args, "scale", None))
+        booted = backend.boot(candidate.facts.key, window, scale)
+        if not booted["is_ok"]:
+            return _failure("boot_failed", decision.verdict, candidate.facts.key, booted.get("detail"), decision.reasons,
+                            "Check the state with device list. Under memory pressure, ask the user before shutting down other devices"), None
+        instance, is_booted_now = booted["instance"], not booted.get("already_booted")
+    claimed = device_claims.claim_device(instance or candidate.facts.key, str(project_root(args)),
+                                         purpose=request.purpose, is_booted_by_lease=is_booted_now,
+                                         backend=backend.name, is_free_required=request.device is None)
+    if claimed is None:
+        return None, None
+    if is_booted_now:
+        device_claims.set_pool_booted(instance or candidate.facts.key, True)
+    # A device someone has used once is no longer a fresh phone
+    device_marks.clear_pristine(candidate.facts.key)
+    return None, {"candidate": candidate, "instance": instance, "booted": is_booted_now, "lease": claimed["lease"],
+                  "unrestored_settings": unrestored}
+
+
+def _decide_with_wait(request: AcquireRequest, wait_seconds: float):
+    """Decide > with wait, poll up to the cap and decide again. > (decision, candidates, waited_total_seconds)"""
+    key = wait_key(request)
+    deadline = time.monotonic() + min(max(wait_seconds, 0), ACQUIRE_WAIT_MAXIMUM_SECONDS)
+    while True:
+        candidates = device_pool_facts.build_candidates(request.platform)
+        context = device_pool_facts.build_context(request.platform, device_claims.waited_seconds(key))
+        decision = decide(request, candidates, context)
+        if decision.verdict != "wait" or time.monotonic() + ACQUIRE_POLL_SECONDS > deadline:
+            break
+        device_claims.record_wait(key)
+        time.sleep(ACQUIRE_POLL_SECONDS)
+    waited_total = device_claims.record_wait(key) if decision.verdict == "wait" else context.waited_seconds
+    return decision, candidates, waited_total
+
+
+def _android_storage_fields(platform: str, dev_id: str) -> dict:
+    """On Android, free space on /data; warn if low — before an install fails from lack of storage (#1186)"""
+    if platform != "android":
+        return {}
+    storage = android_device.read_data_storage(dev_id)
+    if storage is None:
+        return {}
+    fields = {"data_storage": storage}
+    if storage["is_low"]:
+        fields["warning"] = (f"/data has only {storage['free_megabytes']} MB free ({storage['used_percent']}% used) — "
+                             f"app install may fail. {android_device.low_storage_next(dev_id)}")
+    return fields
+
+
+def identity_next(next_step: str) -> str:
+    if device_claims.owner_identity_strength() == "weak":
+        return f"Set a session name with the LAUNCH_SESSION environment variable (right now this session is indistinguishable from others) · {next_step}"
+    return next_step
+
+
+def acquire_once(request: AcquireRequest, args) -> dict:
+    """Borrow one device > response dict (no printing). If it needs booting, get the boot turn and decide again on fresh state."""
+    decision, _, _ = _decide_with_wait(request, getattr(args, "wait", 0) or 0)
+    if decision.verdict in ("reuse", "reclaim", "create") and decision.is_boot_needed:
+        try:
+            with boot_turn.boot_turn():
+                return _acquire_attempts(request, args, wait_seconds=0)
+        except boot_turn.BootTurnBusyError:
+            return {"ok": False, "code": "device_busy", "verdict": "wait",
+                    "reasons": ["Another session is booting a device — devices boot one at a time"],
+                    "next": identity_next("Call device acquire again shortly")}
+    return _acquire_attempts(request, args, wait_seconds=getattr(args, "wait", 0) or 0)
+
+
+def _acquire_attempts(request: AcquireRequest, args, wait_seconds: float) -> dict:
+    for _ in range(CLAIM_RACE_RETRIES):
+        decision, candidates, waited_total = _decide_with_wait(request, wait_seconds)
+        base = {"verdict": decision.verdict, "reasons": list(decision.reasons), "limits": device_pool_facts.limits_view(),
+                "owner_identity": device_claims.owner_identity_strength()}
+        if decision.verdict in ("reuse", "reclaim", "create"):
+            if decision.verdict == "create":
+                failure, candidate = _create_device(request, args)
+            else:
+                failure, candidate = None, next(c for c in candidates if c.facts.key == decision.device_key)
+            if failure is None:
+                failure, taken = _take(decision, candidate, request, args)
+            if failure is not None:
+                return {**base, **failure}
+            if taken is None:
+                continue   # inside the lock another took it first — decide again
+            device_claims.clear_wait(wait_key(request))
+            facts = taken["candidate"].facts
+            dev_id = taken["instance"] or facts.key
+            storage_fields = _android_storage_fields(facts.platform, dev_id)
+            return {**base, **storage_fields, "action": "acquire", "platform": facts.platform, "device": dev_id, "key": facts.key,
+                    "name": facts.name, "lease_id": taken["lease"]["lease_id"], "booted": taken["booted"],
+                    "created": decision.verdict == "create", "unrestored_settings": taken["unrestored_settings"],
+                    "summary": f"Borrowed {facts.name} ({dev_id})" + (" — newly created" if decision.verdict == "create"
+                                                                       else " — booted" if taken["booted"] else ""),
+                    "next": identity_next(f"Work with DEV={dev_id} > when done, device release --device {dev_id}")}
+        if decision.verdict == "wait":
+            return {"ok": False, "code": "device_busy", **base, "waited_total_seconds": round(waited_total),
+                    "owners": list(decision.busy_owners),
+                    "next": identity_next("Call device acquire again with --wait 90, or do other work first")}
+        if decision.verdict == "ask":
+            # On memory risk only --user-approved passes (--yes does not, #972)
+            return {"ok": False, "code": "needs_user", **base, "owners": list(decision.busy_owners),
+                    "is_memory_risk": decision.is_memory_risk, **android_device.host_pressure_fields(),
+                    # When stopped for memory, also show large consumers outside devices (#964)
+                    "non_device_consumers": device_benchmark.non_device_consumers(),
+                    "next": (MEMORY_RISK_NEXT if decision.is_memory_risk
+                             else "Show the reasons to the user as is and ask what to do")}
+        next_step = ("Have a person set up that state on a device, then record it with device mark" if request.needs
+                     else "Check the list with devices and widen the conditions (--form · --os · --device)")
+        return {"ok": False, "code": "no_matching_device", **base, "next": next_step}
+    return {"ok": False, "code": "device_busy", "verdict": "wait", "reasons": ["Other sessions kept claiming the chosen devices first"],
+            "next": "Run device acquire again shortly"}
+
+
+def _clone_for_count(request: AcquireRequest, count: int, args) -> list[dict]:
+    """--count N --need: if fewer than N free devices have that state, clone powered-off sources to cover the shortfall > list of clone results.
+
+    A booted source cannot be cloned (simctl limit) — then no clone happens and acquire returns wait.
+    """
+    from pro_launch.commands.device.lifecycle import clone_device
+    candidates = device_pool_facts.build_candidates(request.platform)
+    free = [c for c in candidates if all(need in c.marks for need in request.needs)
+            and not c.live_other_leases and not c.own_leases]
+    source = next((c for c in free if not c.facts.is_booted and c.capabilities.can_clone
+                   and c.capabilities.can_clone_keep_marks), None)
+    if source is None or len(free) >= count:
+        return []
+    backend = device_backends.backend_named(source.facts.backend)
+    reason = getattr(args, "reason", None) or f"acquire --count {count} --need {','.join(request.needs)}"
+    return [clone_device(source.facts, backend, None, reason, None) for _ in range(count - len(free))]
+
+
+def run_acquire(args) -> int:
+    if args.platform not in ("ios", "android"):
+        return out({"ok": False, "code": "args_required", "error": "--platform ios or android is required",
+                    "next": "device acquire --platform ios --purpose '#issue'"})
+    # --reason is an alias of --purpose (confused with create, #972)
+    request = AcquireRequest(platform=args.platform, form=args.form or "phone", os_minimum=args.os,
+                             device=args.device, purpose=args.purpose or getattr(args, "reason", None),
+                             needs=tuple(getattr(args, "need", None) or ()),
+                             is_fresh_required=bool(getattr(args, "fresh", False)),
+                             is_memory_risk_user_approved=bool(getattr(args, "user_approved", False)))
+    count = max(1, min(int(getattr(args, "count", 1) or 1), ACQUIRE_COUNT_MAXIMUM))
+    if count == 1:
+        return out(acquire_once(request, args))
+    clones = _clone_for_count(request, count, args) if request.needs else []
+    results = []
+    for _ in range(count):
+        results.append(acquire_once(request, args))
+        if results[-1].get("ok") is False:
+            break
+    is_all_taken = len(results) == count and all(r.get("ok") is not False for r in results)
+    return out({"ok": is_all_taken, "code": "ok" if is_all_taken else "partial", "action": "acquire", "count": count,
+                "devices": [r.get("device") for r in results if r.get("ok") is not False], "results": results,
+                "clones": clones,
+                "summary": f"Borrowed {sum(r.get('ok') is not False for r in results)}/{count} devices",
+                "next": "When done with each borrowed device, device release (or device release --all)"
+                        if is_all_taken else "Use or release what was borrowed, and follow next in the failed results"})

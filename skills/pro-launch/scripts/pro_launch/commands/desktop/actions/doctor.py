@@ -1,0 +1,35 @@
+"""`desktop doctor` — checks dependencies, permissions, secure screen and input session at once."""
+from __future__ import annotations
+
+from pro_launch.commands.desktop.common import load_backend
+from pro_launch.commands.desktop.host_app import permission_guidance
+from pro_launch.commands.desktop.input_ops import user_input_check
+from pro_launch.registry import Action
+from pro_launch.runtime import desktop_state
+from pro_launch.runtime.output import out
+
+def execute(args) -> int:
+    be, failure = load_backend()
+    holder = desktop_state.current_holder()
+    session = {"held_by_me": bool(desktop_state.my_session()), "holder": holder.get("session") if holder else None,
+               "purpose": holder.get("purpose") if holder else None}
+    if failure:
+        return out({**failure, "session": session})
+    ready = be.readiness()
+    missing = [k for k, granted in (ready.get("permissions") or {}).items() if not granted]
+    windows = be.windows()
+    idle, is_available = user_input_check(be)
+    keyboard = {"is_available": is_available, "kind": be.user_input_kind if is_available else None,
+                "seconds_since_input": round(idle, 2) if is_available else None}
+    payload = {"ok": not missing, "code": "ok" if not missing else "permission_missing", "platform": be.name,
+               "readiness": ready, "keyboard_check": keyboard, "window_count": len(windows), "session": session,
+               "summary": f"{be.name}: {len(windows)} windows" + (f", missing {', '.join(missing)}" if missing else ""),
+               "next": "desktop windows" if not missing else None}
+    if missing:
+        # Host app name, where to turn it on, and that only a person can (#1132)
+        payload.update(permission_guidance(missing))
+    return out(payload)
+
+
+ACTION = Action(name="doctor", needs="nothing", run=execute, options=(), device_use="none",
+                help="Check packages, OS permissions, security prompts and the input session", example="desktop doctor")

@@ -1,0 +1,142 @@
+# Contributing to projectops
+
+Thanks for helping out. This guide is short on purpose: it covers what you need to get a change from idea to merged PR.
+A Korean version is in [docs/i18n/CONTRIBUTING.ko.md](docs/i18n/CONTRIBUTING.ko.md).
+
+This project follows the [Code of Conduct](CODE_OF_CONDUCT.md). By taking part you agree to it.
+
+## What this project is
+
+projectops is a template and installer (`npx projectops`) that adds GitHub Actions workflows, version management,
+issue/PR templates and agent skills to a repository. If you want to understand how it fits together, start with
+[docs/en/npx-wizard.md](docs/en/npx-wizard.md) and [docs/en/skills.md](docs/en/skills.md).
+For the map of the code and step-by-step guides (add a project type, a CLI flag, a `version.yml` option, a workflow,
+a release-note provider, a language, a skill), read [ARCHITECTURE.md](ARCHITECTURE.md).
+
+## Ways to contribute
+
+- **Report a bug or request a feature**: open an issue. Use the issue forms and include your projectops version,
+  OS, and the run log (see below) for installer problems.
+- **Ask a question**: use [Discussions](https://github.com/Cassiiopeia/projectops/discussions) rather than an issue.
+- **Fix something small**: look for issues labeled `good first issue` or `help wanted`.
+- **Claim an issue before you start**: comment `/assign` on its own line on a `good first issue` or `help wanted` issue and
+  a bot assigns it to you (`/unassign` gives it back), so two people do not fix the same thing. If no pull request is linked within 7 days, the
+  assignment is released and the issue is free again.
+  Open your pull request against `develop` and write `Fixes #<number>` in its description.
+- **Anything bigger** (new project type, new workflow, behavior change): open an issue first and wait for a maintainer
+  to confirm the direction before you write code.
+
+## Set up
+
+You need Node.js 20.12 or newer, Python 3.12 (for the script and skill tests) and Git.
+
+```bash
+git clone https://github.com/<you>/projectops.git
+cd projectops
+git remote add upstream https://github.com/Cassiiopeia/projectops.git
+python3 -m pip install pytest pyyaml
+```
+
+On Windows, use `python` instead of `python3`; `python3` can be the Microsoft Store stub.
+
+The project has no runtime npm dependencies, so there is nothing else to install.
+
+## Run the checks
+
+```bash
+npm test                                                  # guard checks (skill list, options schema)
+python3 -m pytest scripts/tests/ .github/scripts/test/ -q # guard checks (skill docs, Korean line budget, workflow permissions)
+python3 .github/util/flutter/_shared/check-consistency.py   # only if you touched a Flutter wizard
+```
+
+Do not commit new tests: this repository keeps only five guard tests (see `CLAUDE.md`). Check your change by running it, or with a throwaway test you delete afterwards.
+
+CI runs these on Linux for develop pushes and PRs. On main it also runs a CLI smoke test on Linux, macOS and Windows. The installer must keep working on macOS
+(bash 3.2, BSD tools) and Windows, so please do not use Linux-only shell features in `.sh` files.
+
+To try the installer on a scratch project:
+
+```bash
+mkdir /tmp/try && cd /tmp/try && git init
+node /path/to/projectops/bin/projectops.js --lang en
+```
+
+## Translations
+
+New languages are added by adding files, not code. See [docs/TRANSLATING.md](docs/TRANSLATING.md).
+
+## Contributing from a fork
+
+You do not need the branch name and commit format described in the next section. They feed the maintainer's
+automation (issue helper, version bump), not your pull request.
+
+- Use any branch name.
+- Write commit messages as [Conventional Commits](https://www.conventionalcommits.org/) (`fix: handle an empty version.yml`).
+- Start the PR title with the same type (`fix:`, `feat:`, `docs:`). The maintainer squashes the PR when merging and
+  rewrites the title into the project format. That title decides the next version, so say `feat!:` only if existing
+  users' settings or CLI arguments stop working.
+
+## Branches and commits (maintainers)
+
+
+- Work on a branch named `YYYYMMDD_#<issue number>_<short title>` (the issue helper bot posts the exact name in your issue).
+- `develop` collects finished work. `main` is the release branch and is only updated by release PRs.
+- Open your PR against `develop`.
+- Commit message format: `<issue title> : <type> : <what changed> <issue URL>`
+  - `type` is one of `feat`, `fix`, `docs`, `chore`, `refactor`, `test`.
+  - `feat` makes the next release a minor version, `feat!` a major one, everything else a patch.
+    Use `!` only when existing users' settings or CLI arguments stop working.
+- Merging a fork PR that was opened against `main` (maintainers): change its base to `develop`, then check the
+  "Files changed" list before squash-merging. A branch cut from `main` carries main-only release commits (version line,
+  plugin manifests, `package.json`) into the squash. Ask the contributor to rebase onto `develop` if anything beyond
+  their change shows up.
+
+## Releases
+
+- npm `latest` is exactly what is on `main`. Pushing to `main` publishes it as `latest` immediately, with no waiting period or promotion schedule. `develop` is never published to npm, so `latest` only ever carries versions a maintainer decided to release. How often versions ship is the maintainer's choice of when to push to `main`.
+- Release PRs are titled `🚀 Deploy <date>-v<version>`. To hide them in the PR list, filter with `is:pr -head:develop`.
+- This project is actively maintained. Pull requests are reviewed by the code owners listed in `.github/CODEOWNERS`.
+
+## Pull requests
+
+Before you open a PR:
+
+- [ ] There is an issue that describes the change, and the PR links to it.
+- [ ] Checks pass locally and you ran the change itself. Do not commit new tests.
+- [ ] User-facing text is in English and goes through `src/i18n/` (CLI) or the English-first docs. Korean goes in the `ko` catalog. Messages that workflows and scripts post into users' repositories go through `.github/scripts/i18n/` (see [docs/TRANSLATING.md](docs/TRANSLATING.md)).
+- [ ] If you changed a shared workflow, you changed both copies: `.github/workflows/` and `.github/workflows/project-types/common/`.
+- [ ] Workflows declare `permissions:`, and new ones have `workflow_dispatch` and `concurrency`.
+
+## Code conventions
+
+- **Installer (`src/`)**: ES modules, standard library only. Prompts go through `src/ui/`, messages through `src/i18n/`.
+  Comments explain why, not what.
+- **Scripts and skills (Python)**: standard library first. A skill CLI prints JSON and takes its input from arguments or
+  environment variables, never from heredocs or temporary files.
+- **Workflows**: do not rename or delete a shipped workflow without registering it in `src/core/migrations/registry.js`,
+  otherwise existing installs keep the old file.
+- Files that only make sense in this repository must be excluded from user installs in both
+  `src/core/exclusions.js` and `.github/scripts/template_initializer.py`.
+
+## AI-assisted contributions
+
+AI tools are welcome. You are responsible for what you submit:
+
+- Read and understand every line before you open the PR, and run the tests yourself.
+- Say so in the PR description if an agent wrote a significant part of the change.
+- Keep PRs focused. Large generated refactors without a prior issue will be closed.
+- Automated PRs are closed without review when the issue was not claimed with `/assign`, when they change files the
+  issue does not ask about, or when the description claims checks that were not run.
+
+## Reporting problems with the installer
+
+Every `full` and `workflows` run writes a log to `.github/.projectops/logs/` (not tracked by git).
+Attach the `.log` file to your issue, after removing anything private.
+
+## Security
+
+Please do not open public issues for vulnerabilities. See [SECURITY.md](SECURITY.md).
+
+## License
+
+By contributing you agree that your contributions are licensed under the [MIT License](LICENSE).

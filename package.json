@@ -1,0 +1,59 @@
+{
+  "name": "projectops",
+  "version": "4.114.0",
+  "description": "One npx install for GitHub release automation: semantic versioning, changelogs, release PRs, CI/CD workflows and AI agent skills",
+  "keywords": [
+    "github-actions",
+    "release-automation",
+    "semantic-versioning",
+    "semver",
+    "changelog",
+    "release-notes",
+    "ci-cd",
+    "devops",
+    "automation",
+    "github-template",
+    "template",
+    "cli",
+    "flutter",
+    "spring-boot",
+    "react",
+    "python",
+    "agent-skills",
+    "claude-code",
+    "pi-package"
+  ],
+  "license": "MIT",
+  "author": {
+    "name": "Cassiiopeia",
+    "url": "https://github.com/Cassiiopeia"
+  },
+  "homepage": "https://cassiiopeia.github.io/projectops/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Cassiiopeia/projectops.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Cassiiopeia/projectops/issues"
+  },
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  },
+  "bin": {
+    "projectops": "bin/projectops.js"
+  },
+  "engines": {
+    "node": ">=20.12"
+  },
+  "files": [
+    "bin/",
+    "src/"
+  ],
+  "pi": {
+    "skills": [
+      "./skills"
+    ]
+  },
+  "dependencies": {}
+}

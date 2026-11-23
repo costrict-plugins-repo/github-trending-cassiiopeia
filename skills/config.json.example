@@ -1,0 +1,180 @@
+{
+  "preferences": {
+    "language": "ko",
+    "tone": "{concise, plain statements}",
+    "rules": ["{sentences over tables}", "{no emoji}"]
+  },
+  "skills": {
+    "pro-commit": { "template": "{type}({scope}): {description}", "examples": ["{fix(auth): refresh token before expiry}"] },
+    "pro-report": { "sections": ["{Summary}", "{Changes}", "{Verification}"], "tone": "{report style}" },
+    "pro-review": { "rules": ["{security findings always first}"] }
+  },
+  "github": {
+    "default_assignee": "{GitHub_username}",
+    "global_pat": "{ghp_xxxxxxxxxxxxxxxxxxxx}",
+    "commit": {
+      "auto_approve": false
+    },
+    "issue": {
+      "auto_approve": false
+    },
+    "changelog_deploy": {
+      "auto_approve": false
+    },
+    "repos": [
+      {
+        "name": "{project name}",
+        "owner": "{GitHub_username_or_org}",
+        "repo": "{repository_name}",
+        "pat": null,
+        "default": true
+      },
+      {
+        "name": "{another project}",
+        "owner": "{GitHub_username_or_org}",
+        "repo": "{repository_name}",
+        "pat": "{ghp_separate_PAT_if_any}",
+        "default": false,
+        "preferences": { "language": "en" },
+        "skills": { "pro-commit": { "preset": "conventional" } },
+        "commit": {
+          "auto_approve": true
+        },
+        "issue": {
+          "auto_approve": true,
+          "assignee": "{GitHub username of a different assignee for this repo only}"
+        },
+        "changelog_deploy": {
+          "auto_approve": true,
+          "app_release": true
+        }
+      }
+    ]
+  },
+  "output": {
+    "_comment": "Root folder for outputs (md). Defaults to docs/projectops when omitted. A relative path is from the repository root; an absolute path also works.",
+    "root": "docs/projectops"
+  },
+  "image": {
+    "_comment": "pro-image: image tools in priority order (codex = ChatGPT subscription, antigravity = agy CLI, claude-vector = agent SVG), repo art harness folder, extra tools.",
+    "priority": ["codex", "antigravity", "claude-vector"],
+    "require_subscription": true,
+    "harness_dir": "docs/image-harness",
+    "providers": {}
+  },
+  "disk-cleanup": {
+    "_comment": "extras pro-disk-cleanup: folders searched for repositories and worktrees, hours of recent activity to keep, backup folder.",
+    "roots": ["~/projects", "~/work"],
+    "idle_hours": 2,
+    "backup_dir": "~/.projectops/backups/disk-cleanup"
+  },
+  "project-blueprint": {
+    "_comment": "extras pro-project-blueprint: shared infra defined once + a registry of projects that reference it by name (references and non-secret metadata only; unknown keys are kept). pro-brain reads infra.brains and projects.{project}.knowledge to name the brain that syncs a repo's knowledge folder; the on/off switch is in the repo's version.yml. Annotated shape: plugins/projectops-extras/skills/pro-project-blueprint/config.sample.json.",
+    "schema_version": 3,
+    "infra": {
+      "registry": { "provider": "dockerhub", "username": "{docker-username}" },
+      "dns": { "provider": "cloudflare", "root_domain": "{root-domain}" },
+      "servers": {
+        "{server-name}": { "credential": "{launch credential name}", "volume_base_path": "{volume-base}" }
+      },
+      "databases": {
+        "{db-instance}": { "engine": "postgresql", "default_account": "{account}", "accounts": { "{account}": { "role": "{db-role}" } } }
+      },
+      "brains": {
+        "{brain-name}": { "engine": "gbrain", "kind": "team", "token_cred": "gbrain-{project}", "sync_script": "{path of the sync job}" }
+      }
+    },
+    "defaults": {
+      "development_branch": "develop",
+      "deploy_trigger_branch": "deploy"
+    },
+    "projects": {
+      "{project}": {
+        "status": "active",
+        "repos": [{ "github": "{owner/repo}", "local_path": "{absolute path}" }],
+        "deploy": { "server": "{server-name}", "services": [{ "role": "backend", "container": "{project}-back" }] },
+        "database": { "instance": "{db-instance}", "name": "{project}" },
+        "knowledge": { "brain": "{brain-name}", "source_id": "{project}-knowledge" }
+      }
+    }
+  },
+  "skill-bug": {
+    "_comment": "extras watch hook: false stops automatic reports of suspected projectops bugs (default true).",
+    "auto_report": true
+  },
+  "synology-expose": {
+    "instances": [
+      {
+        "name": "{NAS display name}",
+        "ddns": "{your-nas.synology.me}",
+        "domains": [
+          "{example.com}"
+        ],
+        "email": "{your@email.com}",
+        "dns_provider": "{cloudflare|route53|gabia}",
+        "default": true
+      }
+    ]
+  },
+  "ui-design": {
+    "destination": "issue",
+    "auto_approve": false,
+    "devices": ["phone", "tablet", "desktop"],
+    "themes": ["light", "dark"],
+    "projects": [
+      { "match": "{owner/repo or absolute path}", "designer": "{designer GitHub ID}", "devices": ["phone"] }
+    ]
+  },
+  "presentation": {
+    "language": "ko",
+    "time_limit_seconds": 600,
+    "export_formats": ["pdf", "pptx"],
+    "projects": [
+      { "match": "{owner/repo or absolute path}", "deck_root": "docs/talks" }
+    ]
+  },
+  "launch": {
+    "_comment": "launch.credentials is the credential store for every skill's secrets (config-rules.md §9): other sections reference an entry by name.",
+    "login_policy": {
+      "trust_device": "always",
+      "keep_signed_in": "ask",
+      "skip_nags": "always"
+    },
+    "credentials": {
+      "my-server": {
+        "kind": "ssh",
+        "host": "{your-server.example.com}",
+        "port": 22,
+        "user": "{username}",
+        "password": "{password — for key login use \"key_path\": \"~/.ssh/id_ed25519\" instead}",
+        "scope": "test-only",
+        "use_when": "{when it may be used — exactly the scope the user allowed}",
+        "notes": "{naming rules to follow · port range · production services on the server}"
+      },
+      "my-registry": {
+        "kind": "dockerhub",
+        "username": "{username}",
+        "token": "{access token}",
+        "scope": "test-only",
+        "use_when": "{e.g. when registering it as a Secret while testing a deploy workflow}"
+      },
+      "gbrain-{project}": {
+        "_comment": "credential store entry referenced by name elsewhere (token_cred); save the value with cred set --secret-field token --prompt",
+        "kind": "token",
+        "provider": "gbrain",
+        "token": "{token — typed in a terminal, never pasted into chat}",
+        "use_when": "{registering the team brain MCP server for this project}"
+      },
+      "my-google": {
+        "kind": "login",
+        "provider": "google",
+        "surface": "web",
+        "app": "{console.cloud.google.com}",
+        "account": "{me@example.com}",
+        "password": "{password}",
+        "use_when": "{checking the Google developer console}",
+        "login_policy": { "trust_device": "never" }
+      }
+    }
+  }
+}

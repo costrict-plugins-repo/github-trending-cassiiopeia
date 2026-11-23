@@ -1,0 +1,6 @@
+# The repo address is a single-source setting (conventions §5): use TEMPLATE_REPO in src/core/paths.js
+description=No hard-coded repo address in src/ — use the canonical value in src/core/paths.js
+paths=src/
+extensions=.js,.mjs
+exclude=src/core/paths.js,src/i18n/
+pattern=github\.com/Cassiiopeia/projectops|githubusercontent\.com/Cassiiopeia/projectops|["'`]Cassiiopeia/projectops["'`/]
